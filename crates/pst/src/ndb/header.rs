@@ -4,6 +4,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use super::{block_id::*, read_write::*, root::*, *};
+use crate::ndb::node_id::{NodeId, NodeIdType};
 use crate::{crc::compute_crc, AnsiPstFile, PstFile, UnicodePstFile};
 
 /// `dwMagic`
@@ -138,6 +139,33 @@ impl UnicodeHeader {
             next_block,
             ..Self::new(root, crypt_method)
         }
+    }
+
+    pub(crate) fn set_next_block(&mut self, next_block: UnicodeBlockId) {
+        self.next_block = next_block;
+    }
+
+    pub(crate) fn set_next_page(&mut self, next_page: UnicodePageId) {
+        self.next_page = next_page;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_crypt_method(&mut self, crypt_method: NdbCryptMethod) {
+        self.crypt_method = crypt_method;
+    }
+
+    pub(crate) fn next_node_index(&self, id_type: NodeIdType) -> NdbResult<u32> {
+        Ok(self.nids[usize::try_from(id_type)?])
+    }
+
+    pub(crate) fn reserve_node(&mut self, node: NodeId) -> NdbResult<()> {
+        let slot = usize::try_from(node.id_type()?)?;
+        let next = node
+            .index()
+            .checked_add(1)
+            .ok_or(NdbError::InvalidNodeIndex(node.index()))?;
+        self.nids[slot] = self.nids[slot].max(next);
+        Ok(())
     }
 }
 
