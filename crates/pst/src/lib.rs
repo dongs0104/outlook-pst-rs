@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+use byteorder::WriteBytesExt;
 use std::{
     cell::RefMut,
     fmt::Debug,
@@ -21,7 +22,9 @@ mod block_sig;
 mod crc;
 mod encode;
 
-use ltp::{heap::*, prop_context::*, table_context::*, tree::*};
+use ltp::{
+    heap::*, prop_context::*, prop_type::PropertyType, read_write::*, table_context::*, tree::*,
+};
 use messaging::{folder::*, message::*, named_prop::*, search::*, store::*};
 use ndb::{
     block::*, block_id::*, block_ref::*, byte_index::*, header::*, node_id::*, page::*,
@@ -222,6 +225,19 @@ pub struct UnicodePstFile {
     inner: PstFileInner<Self>,
 }
 
+/// Plain-message input supported by the format-spike writer.
+pub struct UnicodePstMessage<'a> {
+    pub subject: &'a str,
+    pub sender_name: &'a str,
+    pub sender_email: &'a str,
+    pub recipient_name: &'a str,
+    pub recipient_email: &'a str,
+    pub body: &'a str,
+    pub message_id: &'a str,
+    /// Number of 100-nanosecond intervals since 1601-01-01 UTC.
+    pub delivery_time: i64,
+}
+
 impl UnicodePstFile {
     pub fn read_from(reader: Box<dyn PstReader>) -> io::Result<Self> {
         let inner = PstFileInner::read_from(reader)?;
@@ -231,6 +247,12 @@ impl UnicodePstFile {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let inner = PstFileInner::open(path)?;
         Ok(Self { inner })
+    }
+
+    /// Create a new Unicode PST containing Inbox and one plain-text message.
+    pub fn create(path: impl AsRef<Path>, message: &UnicodePstMessage<'_>) -> io::Result<Self> {
+        create_unicode_pst(path.as_ref(), message)?;
+        Self::open(path)
     }
 }
 
@@ -426,6 +448,645 @@ const FPMAP_FIRST_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_FIRST_SIZE;
 const FPMAP_FIRST_OFFSET: u64 = AMAP_FIRST_OFFSET + FPMAP_FIRST_DATA_SIZE + (3 * PAGE_SIZE) as u64;
 const FPMAP_PAGE_COUNT: u64 = size_of::<MapBits>() as u64 * 64;
 const FPMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_PAGE_COUNT;
+
+const NEW_PST_BBT_OFFSET: u64 = PMAP_FIRST_OFFSET + PAGE_SIZE as u64;
+const NEW_PST_NBT_OFFSET: u64 = NEW_PST_BBT_OFFSET + PAGE_SIZE as u64;
+const NEW_PST_DATA_OFFSET: u64 = NEW_PST_NBT_OFFSET + PAGE_SIZE as u64;
+
+const NEW_PST_RECORD_KEY: [u8; 16] = [
+    0x4D, 0x45, 0x4D, 0x45, 0x58, 0x2D, 0x50, 0x53, 0x54, 0x2D, 0x56, 0x32, 0x33, 0x00, 0x00, 0x01,
+];
+
+fn heap_id(allocation_index: usize) -> io::Result<HeapId> {
+    Ok(HeapId::new(
+        u16::try_from(allocation_index + 1).map_err(|_| PstError::IntegerConversion)?,
+        0,
+    )?)
+}
+
+fn entry_id_bytes(node_id: NodeId) -> io::Result<Vec<u8>> {
+    let entry_id = EntryId::new(StoreRecordKey::new(NEW_PST_RECORD_KEY), node_id);
+    Vec::try_from(&entry_id)
+}
+
+fn utf16_bytes(value: &str) -> Vec<u8> {
+    value
+        .encode_utf16()
+        .chain(Some(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn finish_heap(
+    mut allocations: Vec<Vec<u8>>,
+    client_signature: HeapNodeType,
+    user_root: HeapId,
+) -> io::Result<Vec<u8>> {
+    const HEAP_HEADER_SIZE: usize = 12;
+    let page_map_offset = allocations.iter().map(Vec::len).sum::<usize>() + HEAP_HEADER_SIZE;
+    let page_map_offset =
+        u16::try_from(page_map_offset).map_err(|_| PstError::IntegerConversion)?;
+    let header = HeapNodeHeader::new(
+        page_map_offset,
+        client_signature,
+        user_root,
+        [HeapFillLevel::Empty; 8],
+    );
+    header.write(&mut allocations[0])?;
+
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(allocations.len() + 1);
+    for allocation in allocations {
+        offsets.push(u16::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?);
+        data.extend_from_slice(&allocation);
+    }
+    offsets.push(u16::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?);
+
+    data.write_u16::<byteorder::LittleEndian>(
+        u16::try_from(offsets.len() - 1).map_err(|_| PstError::IntegerConversion)?,
+    )?;
+    data.write_u16::<byteorder::LittleEndian>(0)?;
+    for offset in offsets {
+        data.write_u16::<byteorder::LittleEndian>(offset)?;
+    }
+    Ok(data)
+}
+
+fn property_context_data(
+    properties: &[(u16, PropertyType, Option<Vec<u8>>, u32)],
+) -> io::Result<Vec<u8>> {
+    let mut allocations = vec![vec![], vec![], vec![]];
+    let mut records = Vec::with_capacity(properties.len());
+
+    for (prop_id, prop_type, value, small) in properties {
+        let record = if let Some(value) = value {
+            let allocation = allocations.len();
+            allocations.push(value.clone());
+            PropertyTreeRecord::new(
+                *prop_id,
+                *prop_type,
+                PropertyValueRecord::Heap(heap_id(allocation)?),
+            )
+        } else {
+            PropertyTreeRecord::new(*prop_id, *prop_type, PropertyValueRecord::Small(*small))
+        };
+        record.write(&mut records)?;
+    }
+
+    let tree_root = heap_id(2)?;
+    let tree_header = HeapTreeHeader::new(2, 6, 0, tree_root)?;
+    tree_header.write(&mut allocations[1])?;
+    allocations[2] = records;
+
+    finish_heap(allocations, HeapNodeType::Properties, heap_id(1)?)
+}
+
+fn table_context_data(row_ids: &[NodeId]) -> io::Result<Vec<u8>> {
+    let row_index = heap_id(2)?;
+    let rows_heap = (!row_ids.is_empty()).then(|| heap_id(4)).transpose()?;
+    let columns = vec![
+        TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_ID_PROP_ID, 0, 4, 0),
+        TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_VERSION_PROP_ID, 4, 4, 1),
+    ];
+    let context = TableContextInfo::new(
+        8,
+        8,
+        8,
+        9,
+        row_index,
+        rows_heap.map(|id| NodeId::from(u32::from(id))),
+        columns,
+    )?;
+
+    let mut context_bytes = Vec::new();
+    context.write(&mut context_bytes)?;
+
+    let tree_root = if row_ids.is_empty() {
+        HeapId::from(0)
+    } else {
+        heap_id(3)?
+    };
+    let tree_header = HeapTreeHeader::new(4, 4, 0, tree_root)?;
+    let mut tree_header_bytes = Vec::new();
+    tree_header.write(&mut tree_header_bytes)?;
+
+    let mut index_bytes = Vec::new();
+    let mut rows = Vec::new();
+    for (index, node_id) in row_ids.iter().enumerate() {
+        let row_id = TableRowId::new(u32::from(*node_id));
+        row_id.write(&mut index_bytes)?;
+        index_bytes.write_u32::<byteorder::LittleEndian>(
+            u32::try_from(index).map_err(|_| PstError::IntegerConversion)?,
+        )?;
+
+        rows.write_u32::<byteorder::LittleEndian>(u32::from(*node_id))?;
+        rows.write_u32::<byteorder::LittleEndian>(0)?;
+        rows.push(0xC0);
+    }
+
+    let mut allocations = vec![vec![], context_bytes, tree_header_bytes];
+    if !row_ids.is_empty() {
+        allocations.push(index_bytes);
+        allocations.push(rows);
+    }
+    finish_heap(allocations, HeapNodeType::Table, heap_id(1)?)
+}
+
+fn recipient_table_data(
+    row_id: NodeId,
+    recipient_name: &str,
+    recipient_email: &str,
+) -> io::Result<Vec<u8>> {
+    let columns = vec![
+        TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_ID_PROP_ID, 0, 4, 0),
+        TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_VERSION_PROP_ID, 4, 4, 1),
+        TableColumnDescriptor::new(PropertyType::Integer32, 0x0C15, 8, 4, 2),
+        TableColumnDescriptor::new(PropertyType::Unicode, 0x3001, 12, 4, 3),
+        TableColumnDescriptor::new(PropertyType::Unicode, 0x39FE, 16, 4, 4),
+    ];
+    let context = TableContextInfo::new(
+        20,
+        20,
+        20,
+        21,
+        heap_id(2)?,
+        Some(NodeId::from(u32::from(heap_id(4)?))),
+        columns,
+    )?;
+    let mut context_bytes = Vec::new();
+    context.write(&mut context_bytes)?;
+
+    let mut tree_header_bytes = Vec::new();
+    HeapTreeHeader::new(4, 4, 0, heap_id(3)?)?.write(&mut tree_header_bytes)?;
+
+    let mut index_bytes = Vec::new();
+    TableRowId::new(u32::from(row_id)).write(&mut index_bytes)?;
+    index_bytes.write_u32::<byteorder::LittleEndian>(0)?;
+
+    let mut row = Vec::new();
+    row.write_u32::<byteorder::LittleEndian>(u32::from(row_id))?;
+    row.write_u32::<byteorder::LittleEndian>(0)?;
+    row.write_i32::<byteorder::LittleEndian>(1)?;
+    row.write_u32::<byteorder::LittleEndian>(u32::from(heap_id(5)?))?;
+    row.write_u32::<byteorder::LittleEndian>(u32::from(heap_id(6)?))?;
+    row.push(0xF8);
+
+    finish_heap(
+        vec![
+            vec![],
+            context_bytes,
+            tree_header_bytes,
+            index_bytes,
+            row,
+            utf16_bytes(recipient_name),
+            utf16_bytes(recipient_email),
+        ],
+        HeapNodeType::Table,
+        heap_id(1)?,
+    )
+}
+
+enum NewBlockData {
+    Data(Vec<u8>),
+    SubNodes(Vec<UnicodeLeafSubNodeTreeEntry>),
+}
+
+struct NewBlock {
+    node: Option<(NodeId, Option<NodeId>, Option<UnicodeBlockId>)>,
+    id: UnicodeBlockId,
+    offset: u64,
+    size: u16,
+    data: NewBlockData,
+}
+
+fn create_unicode_pst(path: &Path, input: &UnicodePstMessage<'_>) -> io::Result<()> {
+    let ipm_subtree = NodeId::new(NodeIdType::NormalFolder, 0x20)?;
+    let inbox = NodeId::new(NodeIdType::NormalFolder, 0x21)?;
+    let ipm_hierarchy = NodeId::new(NodeIdType::HierarchyTable, ipm_subtree.index())?;
+    let inbox_contents = NodeId::new(NodeIdType::ContentsTable, inbox.index())?;
+    let message = NodeId::new(NodeIdType::NormalMessage, 0x40)?;
+    let recipient_table = NodeId::new(NodeIdType::RecipientTable, message.index())?;
+    let store_data = property_context_data(&[
+        (0x0E38, PropertyType::Integer32, None, 0),
+        (
+            0x0FF9,
+            PropertyType::Binary,
+            Some(NEW_PST_RECORD_KEY.to_vec()),
+            0,
+        ),
+        (0x3001, PropertyType::Unicode, Some(utf16_bytes("Memex")), 0),
+        (
+            0x35E0,
+            PropertyType::Binary,
+            Some(entry_id_bytes(ipm_subtree)?),
+            0,
+        ),
+    ])?;
+    let ipm_data = property_context_data(&[
+        (
+            0x3001,
+            PropertyType::Unicode,
+            Some(utf16_bytes("Top of Personal Folders")),
+            0,
+        ),
+        (0x3602, PropertyType::Integer32, None, 0),
+        (0x3603, PropertyType::Integer32, None, 0),
+        (0x360A, PropertyType::Boolean, None, 1),
+        (
+            0x3613,
+            PropertyType::Unicode,
+            Some(utf16_bytes("IPF.Note")),
+            0,
+        ),
+    ])?;
+    let inbox_data = property_context_data(&[
+        (0x3001, PropertyType::Unicode, Some(utf16_bytes("Inbox")), 0),
+        (0x3602, PropertyType::Integer32, None, 0),
+        (0x3603, PropertyType::Integer32, None, 0),
+        (0x360A, PropertyType::Boolean, None, 0),
+        (
+            0x3613,
+            PropertyType::Unicode,
+            Some(utf16_bytes("IPF.Note")),
+            0,
+        ),
+    ])?;
+
+    let message_data = property_context_data(&[
+        (
+            0x001A,
+            PropertyType::Unicode,
+            Some(utf16_bytes("IPM.Note")),
+            0,
+        ),
+        (
+            0x0037,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.subject)),
+            0,
+        ),
+        (
+            0x0039,
+            PropertyType::Time,
+            Some(input.delivery_time.to_le_bytes().to_vec()),
+            0,
+        ),
+        (
+            0x0C1A,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.sender_name)),
+            0,
+        ),
+        (
+            0x0C1F,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.sender_email)),
+            0,
+        ),
+        (
+            0x0E06,
+            PropertyType::Time,
+            Some(input.delivery_time.to_le_bytes().to_vec()),
+            0,
+        ),
+        (0x0E07, PropertyType::Integer32, None, 1),
+        (
+            0x1000,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.body)),
+            0,
+        ),
+        (
+            0x1035,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.message_id)),
+            0,
+        ),
+        (0x3FDE, PropertyType::Integer32, None, 65001),
+    ])?;
+    let recipient_data =
+        recipient_table_data(recipient_table, input.recipient_name, input.recipient_email)?;
+
+    let seeds = vec![
+        (NID_MESSAGE_STORE, None, store_data),
+        (ipm_subtree, Some(NID_ROOT_FOLDER), ipm_data),
+        (ipm_hierarchy, None, table_context_data(&[inbox])?),
+        (inbox, Some(ipm_subtree), inbox_data),
+        (inbox_contents, None, table_context_data(&[message])?),
+        (message, Some(inbox), message_data),
+        (recipient_table, None, recipient_data),
+    ];
+    let mut blocks = Vec::with_capacity(seeds.len() + 1);
+    let mut next_offset = NEW_PST_DATA_OFFSET;
+    for (index, (node_id, parent, data)) in seeds.into_iter().enumerate() {
+        let block_id = UnicodeBlockId::new(
+            false,
+            u64::try_from(index + 1).map_err(|_| PstError::IntegerConversion)?,
+        )?;
+        let size = u16::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?;
+        let disk_size = u64::from(ndb::block::block_size(size + UnicodeBlockTrailer::SIZE));
+        blocks.push(NewBlock {
+            node: Some((node_id, parent, None)),
+            id: block_id,
+            offset: next_offset,
+            size,
+            data: NewBlockData::Data(data),
+        });
+        next_offset += disk_size;
+    }
+    let recipient_block = blocks.last().unwrap().id;
+    let sub_node_id = UnicodeBlockId::new(
+        true,
+        u64::try_from(blocks.len() + 1).map_err(|_| PstError::IntegerConversion)?,
+    )?;
+    let sub_node_entries = vec![UnicodeLeafSubNodeTreeEntry::new(
+        recipient_table,
+        recipient_block,
+        None,
+    )];
+    let sub_node_size =
+        UnicodeSubNodeTreeBlockHeader::HEADER_SIZE + UnicodeLeafSubNodeTreeEntry::ENTRY_SIZE;
+    let disk_size = u64::from(ndb::block::block_size(
+        sub_node_size + UnicodeBlockTrailer::SIZE,
+    ));
+    blocks.push(NewBlock {
+        node: None,
+        id: sub_node_id,
+        offset: next_offset,
+        size: sub_node_size,
+        data: NewBlockData::SubNodes(sub_node_entries),
+    });
+    next_offset += disk_size;
+    if let Some((block, parent)) = blocks.iter_mut().find_map(|block| match block.node {
+        Some((node, parent, _)) if node == message => Some((block, parent)),
+        _ => None,
+    }) {
+        block.node = Some((message, parent, Some(sub_node_id)));
+    }
+    let new_pst_eof = next_offset;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.set_len(new_pst_eof)?;
+
+    let amap_id = UnicodePageId::from(1);
+    let pmap_id = UnicodePageId::from(2);
+    let bbt_id = UnicodePageId::from(3);
+    let nbt_id = UnicodePageId::from(4);
+
+    let bbt_ref = UnicodePageRef::new(bbt_id, UnicodeByteIndex::new(NEW_PST_BBT_OFFSET));
+    let nbt_ref = UnicodePageRef::new(nbt_id, UnicodeByteIndex::new(NEW_PST_NBT_OFFSET));
+    let root = UnicodeRoot::new(
+        UnicodeByteIndex::new(new_pst_eof),
+        UnicodeByteIndex::new(AMAP_FIRST_OFFSET),
+        UnicodeByteIndex::new(AMAP_DATA_SIZE - (new_pst_eof - AMAP_FIRST_OFFSET)),
+        UnicodeByteIndex::new(0),
+        nbt_ref,
+        bbt_ref,
+        AmapStatus::Valid2,
+    );
+    let header = UnicodeHeader::new_file(
+        root,
+        NdbCryptMethod::None,
+        UnicodePageId::from(5),
+        UnicodeBlockId::new(
+            false,
+            u64::try_from(blocks.len() + 1).map_err(|_| PstError::IntegerConversion)?,
+        )?,
+    );
+    file.seek(SeekFrom::Start(0))?;
+    header.write(&mut file)?;
+
+    let mut amap_bits = [0; mem::size_of::<MapBits>()];
+    let occupied_slots = (new_pst_eof - AMAP_FIRST_OFFSET) / 64;
+    for slot in 0..occupied_slots {
+        amap_bits[(slot / 8) as usize] |= 0x80 >> (slot % 8);
+    }
+    let amap_trailer = UnicodePageTrailer::new(PageType::AllocationMap, 0, amap_id, 0);
+    let amap = <UnicodeMapPage<{ PageType::AllocationMap as u8 }> as MapPageReadWrite<
+        UnicodePstFile,
+        { PageType::AllocationMap as u8 },
+    >>::new(amap_bits, amap_trailer)?;
+    file.seek(SeekFrom::Start(AMAP_FIRST_OFFSET))?;
+    <UnicodeMapPage<{ PageType::AllocationMap as u8 }> as MapPageReadWrite<
+        UnicodePstFile,
+        { PageType::AllocationMap as u8 },
+    >>::write(&amap, &mut file)?;
+
+    let pmap_trailer = UnicodePageTrailer::new(PageType::AllocationPageMap, 0, pmap_id, 0);
+    let pmap = <UnicodeMapPage<{ PageType::AllocationPageMap as u8 }> as MapPageReadWrite<
+        UnicodePstFile,
+        { PageType::AllocationPageMap as u8 },
+    >>::new([0xFF; mem::size_of::<MapBits>()], pmap_trailer)?;
+    file.seek(SeekFrom::Start(PMAP_FIRST_OFFSET))?;
+    <UnicodeMapPage<{ PageType::AllocationPageMap as u8 }> as MapPageReadWrite<
+        UnicodePstFile,
+        { PageType::AllocationPageMap as u8 },
+    >>::write(&pmap, &mut file)?;
+
+    let bbt_trailer = UnicodePageTrailer::new(
+        PageType::BlockBTree,
+        PageType::BlockBTree.signature(NEW_PST_BBT_OFFSET, bbt_id.into_u64()),
+        bbt_id,
+        0,
+    );
+    let bbt_entries: Vec<_> = blocks
+        .iter()
+        .map(|block| {
+            UnicodeBlockBTreeEntry::new(
+                UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
+                block.size,
+            )
+        })
+        .collect();
+    let bbt_page = UnicodeBlockBTreePage::new(0, 20, 24, &bbt_entries, bbt_trailer)?;
+    let bbt = UnicodeBlockBTree::Leaf(Box::new(bbt_page));
+    bbt.write(&mut file, bbt_ref)?;
+
+    let nbt_trailer = UnicodePageTrailer::new(
+        PageType::NodeBTree,
+        PageType::NodeBTree.signature(NEW_PST_NBT_OFFSET, nbt_id.into_u64()),
+        nbt_id,
+        0,
+    );
+    let mut nbt_entries: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| {
+            block.node.map(|(node_id, parent, sub_node)| {
+                UnicodeNodeBTreeEntry::new(node_id, block.id, sub_node, parent)
+            })
+        })
+        .collect();
+    nbt_entries.sort_by_key(|entry| entry.key());
+    let nbt_page = UnicodeNodeBTreePage::new(0, 15, 32, &nbt_entries, nbt_trailer)?;
+    let nbt = UnicodeNodeBTree::Leaf(Box::new(nbt_page));
+    nbt.write(&mut file, nbt_ref)?;
+
+    for block in blocks {
+        let block_signature =
+            block_sig::compute_sig(block.offset as u32, u64::from(block.id) as u32);
+        let trailer = UnicodeBlockTrailer::new(block.size, block_signature, 0, block.id)?;
+        file.seek(SeekFrom::Start(block.offset))?;
+        match block.data {
+            NewBlockData::Data(data) => {
+                UnicodeDataBlock::new(NdbCryptMethod::None, data, trailer)?.write(&mut file)?;
+            }
+            NewBlockData::SubNodes(entries) => {
+                let header = UnicodeSubNodeTreeBlockHeader::new(
+                    0,
+                    u16::try_from(entries.len()).map_err(|_| PstError::IntegerConversion)?,
+                );
+                let tree = UnicodeLeafSubNodeTreeBlock::new(header, entries, trailer)?;
+                SubNodeTree::<UnicodePstFile>::Leaf(Box::new(tree)).write(
+                    &mut file,
+                    &UnicodeBlockBTreeEntry::new(
+                        UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
+                        block.size,
+                    ),
+                )?;
+            }
+        }
+    }
+
+    file.sync_all()
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod create_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn creates_a_reopenable_unicode_pst_with_one_message() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-create-{}-{stamp}.pst",
+            std::process::id()
+        ));
+
+        let input = UnicodePstMessage {
+            subject: "Memex PST export",
+            sender_name: "Memex Sender",
+            sender_email: "sender@example.com",
+            recipient_name: "Memex Recipient",
+            recipient_email: "recipient@example.com",
+            body: "Hello from Memex PST export.",
+            message_id: "<memex-pst-export@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+        let pst = UnicodePstFile::create(&path, &input).unwrap();
+        assert_eq!(pst.header().version(), NdbVersion::Unicode);
+        assert!(pst.header().root().file_eof_index().index() > NEW_PST_DATA_OFFSET);
+        drop(pst);
+
+        let reopened = UnicodePstFile::open(&path).unwrap();
+        assert_eq!(reopened.header().version(), NdbVersion::Unicode);
+        assert!(!reopened
+            .read_block(UnicodeBlockId::new(false, 1).unwrap())
+            .unwrap()
+            .is_empty());
+        {
+            let mut reader = reopened.reader().lock().unwrap();
+            let root = reopened.header().root();
+            let nbt = UnicodeNodeBTree::read(&mut *reader, *root.node_btree()).unwrap();
+            let bbt = UnicodeBlockBTree::read(&mut *reader, *root.block_btree()).unwrap();
+            let node = nbt
+                .find_entry(
+                    &mut *reader,
+                    u64::from(u32::from(NID_MESSAGE_STORE)),
+                    &mut Default::default(),
+                )
+                .unwrap();
+            let heap = UnicodeHeapNode::read(
+                &mut *reader,
+                &bbt,
+                &mut Default::default(),
+                NdbCryptMethod::None,
+                node.data().search_key(),
+            )
+            .unwrap();
+            let heap_header = heap.header().unwrap();
+            let tree = UnicodeHeapTree::<PropertyTreeRecordKey, PropertyTreeRecordValue>::new(
+                heap,
+                heap_header.user_root(),
+            );
+            let tree_header = tree.header().unwrap();
+            assert_eq!(tree_header.key_size(), 2);
+            assert_eq!(
+                tree.heap().find_entry(tree_header.root()).unwrap().len(),
+                32
+            );
+            assert_eq!(tree.entries().unwrap().len(), 4);
+        }
+        let store = UnicodeStore::read(Rc::new(reopened)).unwrap();
+        assert_eq!(store.properties().display_name().unwrap(), "Memex");
+        assert_eq!(
+            store
+                .properties()
+                .ipm_sub_tree_entry_id()
+                .unwrap()
+                .node_id(),
+            NodeId::new(NodeIdType::NormalFolder, 0x20).unwrap()
+        );
+        let ipm = store
+            .open_folder(&store.properties().ipm_sub_tree_entry_id().unwrap())
+            .unwrap();
+        assert_eq!(
+            ipm.properties().display_name().unwrap(),
+            "Top of Personal Folders"
+        );
+        let inbox_row = ipm.hierarchy_table().unwrap().rows_matrix().next().unwrap();
+        let inbox_id = NodeId::from(u32::from(inbox_row.id()));
+        let inbox = store
+            .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
+            .unwrap();
+        assert_eq!(inbox.properties().display_name().unwrap(), "Inbox");
+        let contents = inbox.contents_table().unwrap();
+        let message_row = contents.rows_matrix().next().unwrap();
+        let message_id = NodeId::from(u32::from(message_row.id()));
+        let message = store
+            .open_message(&store.properties().make_entry_id(message_id).unwrap(), None)
+            .unwrap();
+        match message.properties().get(0x0037).unwrap() {
+            PropertyValue::Unicode(value) => assert_eq!(value.to_string(), "Memex PST export"),
+            value => panic!("unexpected subject value: {value:?}"),
+        }
+        match message.properties().get(0x1000).unwrap() {
+            PropertyValue::Unicode(value) => {
+                assert_eq!(value.to_string(), "Hello from Memex PST export.")
+            }
+            value => panic!("unexpected body value: {value:?}"),
+        }
+
+        let recipients = message.recipient_table().unwrap();
+        let row = recipients.rows_matrix().next().unwrap();
+        let values = row.columns(recipients.context()).unwrap();
+        let smtp_column = recipients
+            .context()
+            .columns()
+            .iter()
+            .zip(values)
+            .find(|(column, _)| column.prop_id() == 0x39FE)
+            .unwrap();
+        let smtp = recipients
+            .read_column(smtp_column.1.as_ref().unwrap(), smtp_column.0.prop_type())
+            .unwrap();
+        match smtp {
+            PropertyValue::Unicode(value) => {
+                assert_eq!(value.to_string(), "recipient@example.com")
+            }
+            value => panic!("unexpected recipient value: {value:?}"),
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
 
 struct AllocationMapPageInfo<Pst>
 where

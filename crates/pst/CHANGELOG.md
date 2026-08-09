@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- create a new Unicode PST containing Inbox and one plain-text message
+- generate a compatibility fixture for Outlook and SCANPST validation
+
 ## [1.2.0](https://github.com/microsoft/outlook-pst-rs/compare/outlook-pst-v1.1.0...outlook-pst-v1.2.0) - 2026-03-17
 
 ### Added
