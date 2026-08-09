@@ -1,20 +1,27 @@
 [package]
-name = "outlook-pst"
-description = "Outlook PST Store Provider in Rust"
-version = "1.2.0"
+name = "outlook-pst-rw"
+description = "Read Outlook PST files and create new Unicode PST archives"
+version = "0.1.0"
 
-authors.workspace = true
+authors = ["Microsoft", "dongs0104"]
 edition.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+repository = "https://github.com/dongs0104/outlook-pst-rs"
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[lib]
+name = "outlook_pst"
 
 [dependencies]
 byteorder.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[[example]]
+name = "gen-fixture-pst"
+path = "examples/gen-fixture-pst.rs"
 
 [dev-dependencies]
 anyhow.workspace = true

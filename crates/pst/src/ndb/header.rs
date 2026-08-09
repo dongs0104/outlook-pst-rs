@@ -126,6 +126,19 @@ impl UnicodeHeader {
             reserved3: [0; 36],
         }
     }
+
+    pub(crate) fn new_file(
+        root: UnicodeRoot,
+        crypt_method: NdbCryptMethod,
+        next_page: UnicodePageId,
+        next_block: UnicodeBlockId,
+    ) -> Self {
+        Self {
+            next_page,
+            next_block,
+            ..Self::new(root, crypt_method)
+        }
+    }
 }
 
 impl Header<UnicodePstFile> for UnicodeHeader {
