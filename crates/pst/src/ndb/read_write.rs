@@ -113,6 +113,7 @@ where
     }
 
     fn set_amap_status(&mut self, status: AmapStatus);
+    fn set_amap_last_index(&mut self, index: <Pst as PstFile>::ByteIndex);
     fn reset_free_size(&mut self, free_bytes: <Pst as PstFile>::ByteIndex) -> NdbResult<()>;
 }
 

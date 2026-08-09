@@ -90,6 +90,15 @@ impl UnicodeRoot {
             reserved3: Default::default(),
         }
     }
+
+    pub(crate) fn set_file_eof_index(&mut self, file_eof_index: UnicodeByteIndex) {
+        self.file_eof_index = file_eof_index;
+    }
+
+    pub(crate) fn set_btrees(&mut self, node_btree: UnicodePageRef, block_btree: UnicodePageRef) {
+        self.node_btree = node_btree;
+        self.block_btree = block_btree;
+    }
 }
 
 impl Root<UnicodePstFile> for UnicodeRoot {
@@ -163,6 +172,10 @@ impl RootReadWrite<UnicodePstFile> for UnicodeRoot {
 
     fn set_amap_status(&mut self, status: AmapStatus) {
         self.amap_is_valid = status;
+    }
+
+    fn set_amap_last_index(&mut self, index: UnicodeByteIndex) {
+        self.amap_last_index = index;
     }
 
     fn reset_free_size(&mut self, free_bytes: UnicodeByteIndex) -> NdbResult<()> {
@@ -282,6 +295,10 @@ impl RootReadWrite<AnsiPstFile> for AnsiRoot {
 
     fn set_amap_status(&mut self, status: AmapStatus) {
         self.amap_is_valid = status;
+    }
+
+    fn set_amap_last_index(&mut self, index: AnsiByteIndex) {
+        self.amap_last_index = index;
     }
 
     fn reset_free_size(&mut self, free_bytes: AnsiByteIndex) -> NdbResult<()> {

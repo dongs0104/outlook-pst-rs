@@ -1,6 +1,6 @@
 # Outlook PST Store Provider in Rust
 
-This fork adds append-only creation of new Unicode PST files. The original implementation and history come from [Microsoft's MIT-licensed `outlook-pst-rs`](https://github.com/microsoft/outlook-pst-rs); this fork is not sponsored by Microsoft.
+This fork adds creation and incremental append support for Unicode PST files. The original implementation and history come from [Microsoft's MIT-licensed `outlook-pst-rs`](https://github.com/microsoft/outlook-pst-rs); this fork is not sponsored by Microsoft.
 
 This project contains a collection of Rust crates which are meant to be a "clean room"
 implementation of the [MS-PST](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/141923d5-15ab-4ef1-a524-6dce75aae546)

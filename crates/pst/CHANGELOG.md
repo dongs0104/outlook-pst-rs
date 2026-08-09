@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-08-09
+
+### Added
+
+- append plain-text messages to existing unencrypted Unicode PSTs
+- write large message bodies and by-value file attachments using data trees
+- mark messages with attachments in message flags and properties
+- write multi-level BBT, NBT, and subnode trees
+- allocate and rebuild multiple AMap regions and their periodic metadata pages
+
+### Changed
+
+- preserve existing receive-folder properties, contents-table schemas, rows, and subnodes
+- commit appended BBT/NBT roots copy-on-write and update the receive-folder content count
+
 ## [1.2.1] - 2026-08-09
 
 ### Added

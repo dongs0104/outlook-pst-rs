@@ -273,6 +273,10 @@ impl TableContextInfo {
     pub fn columns(&self) -> &[TableColumnDescriptor] {
         &self.columns
     }
+
+    pub fn rows(&self) -> Option<NodeId> {
+        self.rows
+    }
 }
 
 impl TableContextInfoReadWrite for TableContextInfo {
