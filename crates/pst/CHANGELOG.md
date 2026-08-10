@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-08-10
+
+### Added
+
+- write TO, CC, and BCC recipient rows for every message recipient
+- write optional UTF-8 HTML as `PR_HTML` while retaining `PR_BODY`
+- write zero-byte by-value attachments
+
+### Changed
+
+- replace the single recipient name and email fields with a recipient slice
+
 ## [1.2.2] - 2026-08-09
 
 ### Added

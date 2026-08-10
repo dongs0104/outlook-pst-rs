@@ -232,6 +232,10 @@ pub struct UnicodeValue {
 }
 
 impl UnicodeValue {
+    pub(crate) fn new(buffer: Vec<u16>) -> Self {
+        Self { buffer }
+    }
+
     pub fn buffer(&self) -> &[u16] {
         &self.buffer
     }
@@ -1036,7 +1040,10 @@ where
         match value.value() {
             PropertyValueRecord::Heap(heap_id) => {
                 if u32::from(heap_id) == 0 {
-                    return Ok(PropertyValue::Null);
+                    return Ok(match value.prop_type() {
+                        PropertyType::Binary => PropertyValue::Binary(BinaryValue::default()),
+                        _ => PropertyValue::Null,
+                    });
                 }
 
                 let data = self.tree.heap().find_entry(heap_id)?;
