@@ -1,4 +1,7 @@
-use outlook_pst::{UnicodePstAttachment, UnicodePstFile, UnicodePstMessage};
+use outlook_pst::{
+    UnicodePstAttachment, UnicodePstFile, UnicodePstMessage, UnicodePstRecipient,
+    UnicodePstRecipientType,
+};
 use std::{env, io, path::PathBuf};
 
 fn main() -> io::Result<()> {
@@ -13,13 +16,35 @@ fn main() -> io::Result<()> {
     } else {
         "Hello from Memex PST export.".to_string()
     };
+    let html = if stress {
+        "<p>Large HTML body 본문.</p>".repeat(1_000)
+    } else {
+        "<p>Hello from <strong>Memex PST export</strong>.</p>".to_string()
+    };
+    let recipients = [
+        UnicodePstRecipient {
+            name: "Memex Recipient",
+            email: "recipient@example.com",
+            recipient_type: UnicodePstRecipientType::To,
+        },
+        UnicodePstRecipient {
+            name: "Memex CC",
+            email: "cc@example.com",
+            recipient_type: UnicodePstRecipientType::Cc,
+        },
+        UnicodePstRecipient {
+            name: "Memex BCC",
+            email: "bcc@example.com",
+            recipient_type: UnicodePstRecipientType::Bcc,
+        },
+    ];
     let message = UnicodePstMessage {
         subject: "Memex PST export",
         sender_name: "Memex Sender",
         sender_email: "sender@example.com",
-        recipient_name: "Memex Recipient",
-        recipient_email: "recipient@example.com",
+        recipients: &recipients,
         body: &body,
+        html_body: Some(&html),
         message_id: "<memex-pst-export@example.com>",
         delivery_time: 133_750_080_000_000_000,
     };
@@ -30,10 +55,15 @@ fn main() -> io::Result<()> {
             mime_type: "application/octet-stream",
             data: &data,
         };
+        let empty_attachment = UnicodePstAttachment {
+            filename: "empty.txt",
+            mime_type: "text/plain",
+            data: &[],
+        };
         drop(UnicodePstFile::create_with_attachments(
             &path,
             &message,
-            &[attachment],
+            &[attachment, empty_attachment],
         )?);
         for index in 1..10 {
             let subject = format!("Appended message {index}");

@@ -225,15 +225,33 @@ pub struct UnicodePstFile {
     inner: PstFileInner<Self>,
 }
 
-/// Plain-text message input for the Unicode PST writer.
+/// A recipient type written to `PR_RECIPIENT_TYPE`.
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnicodePstRecipientType {
+    To = 1,
+    Cc = 2,
+    Bcc = 3,
+}
+
+/// A message recipient for the Unicode PST writer.
+#[derive(Clone, Copy)]
+pub struct UnicodePstRecipient<'a> {
+    pub name: &'a str,
+    pub email: &'a str,
+    pub recipient_type: UnicodePstRecipientType,
+}
+
+/// Message input for the Unicode PST writer.
 #[derive(Clone, Copy)]
 pub struct UnicodePstMessage<'a> {
     pub subject: &'a str,
     pub sender_name: &'a str,
     pub sender_email: &'a str,
-    pub recipient_name: &'a str,
-    pub recipient_email: &'a str,
+    pub recipients: &'a [UnicodePstRecipient<'a>],
     pub body: &'a str,
+    /// UTF-8 HTML for `PR_HTML`; `body` remains the plain-text fallback.
+    pub html_body: Option<&'a str>,
     pub message_id: &'a str,
     /// Number of 100-nanosecond intervals since 1601-01-01 UTC.
     pub delivery_time: i64,
@@ -260,7 +278,7 @@ impl UnicodePstFile {
         Ok(Self { inner })
     }
 
-    /// Create a new Unicode PST containing Inbox and one plain-text message.
+    /// Create a new Unicode PST containing Inbox and one message.
     pub fn create(path: impl AsRef<Path>, message: &UnicodePstMessage<'_>) -> io::Result<Self> {
         create_unicode_pst(path.as_ref(), message, &[])?;
         Self::open(path)
@@ -276,7 +294,7 @@ impl UnicodePstFile {
         Self::open(path)
     }
 
-    /// Append one plain-text message to the default receive folder (normally Inbox) of an
+    /// Append one message to the default receive folder (normally Inbox) of an
     /// existing unencrypted Unicode PST.
     pub fn append(path: impl AsRef<Path>, message: &UnicodePstMessage<'_>) -> io::Result<Self> {
         append_unicode_pst(path.as_ref(), message, &[])?;
@@ -736,7 +754,9 @@ fn property_context_pages(
                 PropertyValueRecord::Small(small)
             } else {
                 let data = property_value_bytes(&value)?;
-                if data.len() > MAX_HEAP_ALLOCATION_SIZE {
+                if data.is_empty() {
+                    PropertyValueRecord::Heap(HeapId::default())
+                } else if data.len() > MAX_HEAP_ALLOCATION_SIZE {
                     let node = NodeId::new(NodeIdType::Internal, next_subnode_index)?;
                     next_subnode_index = next_subnode_index
                         .checked_add(1)
@@ -830,12 +850,12 @@ fn write_fixed_table_value(
 fn encode_table_row(
     context: &TableContextInfo,
     heap: &mut HeapBuilder,
-    row_id: NodeId,
+    row_id: impl Into<u32>,
     unique: u32,
     cells: Vec<Option<TableCell>>,
 ) -> io::Result<Vec<u8>> {
     let mut row = vec![0; usize::from(context.end_existence_bitmap())];
-    (&mut row[0..4]).write_u32::<byteorder::LittleEndian>(u32::from(row_id))?;
+    (&mut row[0..4]).write_u32::<byteorder::LittleEndian>(row_id.into())?;
     (&mut row[4..8]).write_u32::<byteorder::LittleEndian>(unique)?;
 
     for (column, cell) in context.columns().iter().zip(cells) {
@@ -866,7 +886,11 @@ fn encode_table_row(
     Ok(row)
 }
 
-fn build_row_index(heap: &mut HeapBuilder, rows: &[NodeId]) -> io::Result<HeapId> {
+fn build_row_index<T>(heap: &mut HeapBuilder, rows: &[T]) -> io::Result<HeapId>
+where
+    T: Copy,
+    u32: From<T>,
+{
     let mut children = rows
         .chunks(750)
         .enumerate()
@@ -914,6 +938,24 @@ fn string_table_cell(prop_type: PropertyType, value: &str) -> Option<TableCell> 
     }
 }
 
+fn recipient_display(
+    recipients: &[UnicodePstRecipient<'_>],
+    recipient_type: UnicodePstRecipientType,
+) -> String {
+    recipients
+        .iter()
+        .filter(|recipient| recipient.recipient_type == recipient_type)
+        .map(|recipient| {
+            if recipient.name.is_empty() {
+                recipient.email
+            } else {
+                recipient.name
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn new_message_table_cell(
     column: &TableColumnDescriptor,
     input: &UnicodePstMessage<'_>,
@@ -934,7 +976,17 @@ fn new_message_table_cell(
         0x0037 | 0x0E1D | 0x0070 | 0x3001 => string_table_cell(prop_type, input.subject),
         0x0C1A => string_table_cell(prop_type, input.sender_name),
         0x0C1F => string_table_cell(prop_type, input.sender_email),
-        0x0E04 => string_table_cell(prop_type, input.recipient_name),
+        0x0E02..=0x0E04 => {
+            let recipient_type = match column.prop_id() {
+                0x0E02 => UnicodePstRecipientType::Bcc,
+                0x0E03 => UnicodePstRecipientType::Cc,
+                _ => UnicodePstRecipientType::To,
+            };
+            let display = recipient_display(input.recipients, recipient_type);
+            (!display.is_empty())
+                .then(|| string_table_cell(prop_type, &display))
+                .flatten()
+        }
         0x1035 => string_table_cell(prop_type, input.message_id),
         0x0039 | 0x0E06 | 0x3008 if prop_type == PropertyType::Time => {
             Some(TableCell::Value(PropertyValue::Time(input.delivery_time)))
@@ -944,6 +996,7 @@ fn new_message_table_cell(
         )),
         0x0E08 if prop_type == PropertyType::Integer32 => {
             let size = input.body.len()
+                + input.html_body.map_or(0, str::len)
                 + input.subject.len()
                 + attachments
                     .iter()
@@ -1147,58 +1200,66 @@ fn table_context_data(row_ids: &[NodeId]) -> io::Result<Vec<u8>> {
     finish_heap(allocations, HeapNodeType::Table, heap_id(1)?)
 }
 
+type RebuiltRecipientTable = (Vec<Vec<u8>>, Option<(NodeId, Vec<Vec<u8>>)>);
+
 fn recipient_table_data(
-    row_id: NodeId,
-    recipient_name: &str,
-    recipient_email: &str,
-) -> io::Result<Vec<u8>> {
+    recipients: &[UnicodePstRecipient<'_>],
+) -> io::Result<RebuiltRecipientTable> {
     let columns = vec![
         TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_ID_PROP_ID, 0, 4, 0),
         TableColumnDescriptor::new(PropertyType::Integer32, LTP_ROW_VERSION_PROP_ID, 4, 4, 1),
         TableColumnDescriptor::new(PropertyType::Integer32, 0x0C15, 8, 4, 2),
         TableColumnDescriptor::new(PropertyType::Unicode, 0x3001, 12, 4, 3),
-        TableColumnDescriptor::new(PropertyType::Unicode, 0x39FE, 16, 4, 4),
+        TableColumnDescriptor::new(PropertyType::Unicode, 0x3002, 16, 4, 4),
+        TableColumnDescriptor::new(PropertyType::Unicode, 0x3003, 20, 4, 5),
+        TableColumnDescriptor::new(PropertyType::Unicode, 0x39FE, 24, 4, 6),
     ];
-    let context = TableContextInfo::new(
-        20,
-        20,
-        20,
-        21,
-        heap_id(2)?,
-        Some(NodeId::from(u32::from(heap_id(4)?))),
-        columns,
-    )?;
+    let row_context =
+        TableContextInfo::new(28, 28, 28, 29, HeapId::default(), None, columns.clone())?;
+    let row_ids = (1..=recipients.len())
+        .map(|id| u32::try_from(id).map_err(|_| PstError::IntegerConversion.into()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut heap = HeapBuilder::new();
+    let rows = row_ids
+        .iter()
+        .zip(recipients)
+        .map(|(row_id, recipient)| {
+            encode_table_row(
+                &row_context,
+                &mut heap,
+                *row_id,
+                0,
+                vec![
+                    Some(TableCell::Value(PropertyValue::Integer32(
+                        i32::try_from(*row_id).map_err(|_| PstError::IntegerConversion)?,
+                    ))),
+                    Some(TableCell::Value(PropertyValue::Integer32(0))),
+                    Some(TableCell::Value(PropertyValue::Integer32(
+                        recipient.recipient_type as i32,
+                    ))),
+                    string_table_cell(PropertyType::Unicode, recipient.name),
+                    string_table_cell(PropertyType::Unicode, "SMTP"),
+                    string_table_cell(PropertyType::Unicode, recipient.email),
+                    string_table_cell(PropertyType::Unicode, recipient.email),
+                ],
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let row_index = build_row_index(&mut heap, &row_ids)?;
+    let rows_node = (!rows.is_empty())
+        .then(|| NodeId::new(NodeIdType::Internal, 0x80))
+        .transpose()?;
+    let context = TableContextInfo::new(28, 28, 28, 29, row_index, rows_node, columns)?;
     let mut context_bytes = Vec::new();
     context.write(&mut context_bytes)?;
-
-    let mut tree_header_bytes = Vec::new();
-    HeapTreeHeader::new(4, 4, 0, heap_id(3)?)?.write(&mut tree_header_bytes)?;
-
-    let mut index_bytes = Vec::new();
-    TableRowId::new(u32::from(row_id)).write(&mut index_bytes)?;
-    index_bytes.write_u32::<byteorder::LittleEndian>(0)?;
-
-    let mut row = Vec::new();
-    row.write_u32::<byteorder::LittleEndian>(u32::from(row_id))?;
-    row.write_u32::<byteorder::LittleEndian>(0)?;
-    row.write_i32::<byteorder::LittleEndian>(1)?;
-    row.write_u32::<byteorder::LittleEndian>(u32::from(heap_id(5)?))?;
-    row.write_u32::<byteorder::LittleEndian>(u32::from(heap_id(6)?))?;
-    row.push(0xF8);
-
-    finish_heap(
-        vec![
-            vec![],
-            context_bytes,
-            tree_header_bytes,
-            index_bytes,
-            row,
-            utf16_bytes(recipient_name),
-            utf16_bytes(recipient_email),
-        ],
-        HeapNodeType::Table,
-        heap_id(1)?,
-    )
+    let user_root = heap.alloc(context_bytes)?;
+    let pages = heap.finish(HeapNodeType::Table, user_root)?;
+    let rows_per_block = MAX_DATA_BLOCK_SIZE / 29;
+    let row_chunks = rows
+        .chunks(rows_per_block)
+        .map(|chunk| chunk.concat())
+        .collect::<Vec<_>>();
+    Ok((pages, rows_node.map(|node| (node, row_chunks))))
 }
 
 fn inbox_data(content_count: usize) -> io::Result<Vec<u8>> {
@@ -1219,78 +1280,49 @@ fn inbox_data(content_count: usize) -> io::Result<Vec<u8>> {
 
 fn message_data(
     input: &UnicodePstMessage<'_>,
-    body_node: Option<NodeId>,
     has_attachments: bool,
-) -> io::Result<Vec<u8>> {
-    property_context_data_with_nodes(
-        &[
-            (
-                0x001A,
-                PropertyType::Unicode,
-                Some(utf16_bytes("IPM.Note")),
-                0,
-            ),
-            (
-                0x0037,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.subject)),
-                0,
-            ),
-            (
-                0x0039,
-                PropertyType::Time,
-                Some(input.delivery_time.to_le_bytes().to_vec()),
-                0,
-            ),
-            (
-                0x0C1A,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.sender_name)),
-                0,
-            ),
-            (
-                0x0C1F,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.sender_email)),
-                0,
-            ),
-            (
-                0x0E06,
-                PropertyType::Time,
-                Some(input.delivery_time.to_le_bytes().to_vec()),
-                0,
-            ),
-            (
-                0x0E07,
-                PropertyType::Integer32,
-                None,
-                1 | if has_attachments { 0x10 } else { 0 },
-            ),
-            (
-                0x0E1B,
-                PropertyType::Boolean,
-                None,
-                u32::from(has_attachments),
-            ),
-            (
-                0x1000,
-                PropertyType::Unicode,
-                body_node.is_none().then(|| utf16_bytes(input.body)),
-                0,
-            ),
-            (
-                0x1035,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.message_id)),
-                0,
-            ),
-            (0x3FDE, PropertyType::Integer32, None, 65001),
-        ],
-        &body_node.map(|node| [(0x1000, node)]).unwrap_or_default(),
-    )
+) -> io::Result<RebuiltPropertyContext> {
+    let unicode =
+        |value: &str| PropertyValue::Unicode(UnicodeValue::new(value.encode_utf16().collect()));
+    let mut properties = vec![
+        (0x001A, unicode("IPM.Note")),
+        (0x0037, unicode(input.subject)),
+        (0x0039, PropertyValue::Time(input.delivery_time)),
+        (0x0C1A, unicode(input.sender_name)),
+        (0x0C1F, unicode(input.sender_email)),
+        (0x0E06, PropertyValue::Time(input.delivery_time)),
+        (
+            0x0E07,
+            PropertyValue::Integer32(1 | if has_attachments { 0x10 } else { 0 }),
+        ),
+        (0x0E1B, PropertyValue::Boolean(has_attachments)),
+        (0x1000, unicode(input.body)),
+        (0x1035, unicode(input.message_id)),
+        (0x3FDE, PropertyValue::Integer32(65001)),
+    ];
+    for (id, recipient_type) in [
+        (0x0E02, UnicodePstRecipientType::Bcc),
+        (0x0E03, UnicodePstRecipientType::Cc),
+        (0x0E04, UnicodePstRecipientType::To),
+    ] {
+        let display = recipient_display(input.recipients, recipient_type);
+        if !display.is_empty() {
+            properties.push((id, unicode(&display)));
+        }
+    }
+    if let Some(html) = input.html_body {
+        properties.push((
+            0x1013,
+            PropertyValue::Binary(BinaryValue::new(html.as_bytes().to_vec())),
+        ));
+    }
+    property_context_pages(properties, 0x80)
 }
 
-fn attachment_data(input: &UnicodePstAttachment<'_>, data_node: NodeId) -> io::Result<Vec<u8>> {
+fn attachment_data(
+    input: &UnicodePstAttachment<'_>,
+    data_node: Option<NodeId>,
+) -> io::Result<Vec<u8>> {
     let size = i32::try_from(input.data.len()).map_err(|_| PstError::IntegerConversion)?;
     property_context_data_with_nodes(
         &[
@@ -1317,7 +1349,7 @@ fn attachment_data(input: &UnicodePstAttachment<'_>, data_node: NodeId) -> io::R
                 0,
             ),
         ],
-        &[(0x3701, data_node)],
+        &data_node.map(|node| [(0x3701, node)]).unwrap_or_default(),
     )
 }
 
@@ -1712,6 +1744,28 @@ fn push_data_tree_chunks(
     Ok(ids[0])
 }
 
+fn push_recipient_table(
+    blocks: &mut Vec<NewBlock>,
+    next_bid: &mut u64,
+    next_offset: &mut u64,
+    recipients: &[UnicodePstRecipient<'_>],
+) -> io::Result<(UnicodeBlockId, Option<UnicodeBlockId>)> {
+    let (pages, rows) = recipient_table_data(recipients)?;
+    let data = push_data_tree_chunks(blocks, next_bid, next_offset, pages)?;
+    let subnodes = if let Some((rows_node, row_chunks)) = rows {
+        let rows = push_data_tree_chunks(blocks, next_bid, next_offset, row_chunks)?;
+        Some(push_subnode_tree(
+            blocks,
+            next_bid,
+            next_offset,
+            vec![UnicodeLeafSubNodeTreeEntry::new(rows_node, rows, None)],
+        )?)
+    } else {
+        None
+    };
+    Ok((data, subnodes))
+}
+
 fn push_subnode_tree(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
@@ -1830,15 +1884,6 @@ fn push_attachments(
     if attachments.is_empty() {
         return Ok(());
     }
-    if attachments
-        .iter()
-        .any(|attachment| attachment.data.is_empty())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "empty attachments are not supported",
-        ));
-    }
     let attachment_table = NodeId::new(NodeIdType::AttachmentTable, message.index())?;
     let attachment_ids = (0..attachments.len())
         .map(|index| {
@@ -1862,20 +1907,28 @@ fn push_attachments(
     for (index, (attachment_id, attachment)) in
         attachment_ids.into_iter().zip(attachments).enumerate()
     {
-        let data_node = NodeId::new(
-            NodeIdType::Internal,
-            0x200 + u32::try_from(index).map_err(|_| PstError::IntegerConversion)?,
-        )?;
-        let data_block = push_data_tree(blocks, next_bid, next_offset, attachment.data)?;
-        let attachment_subnode = push_block(
-            blocks,
-            next_bid,
-            next_offset,
-            true,
-            NewBlockData::SubNodes(vec![UnicodeLeafSubNodeTreeEntry::new(
-                data_node, data_block, None,
-            )]),
-        )?;
+        let data_node = if attachment.data.is_empty() {
+            None
+        } else {
+            Some(NodeId::new(
+                NodeIdType::Internal,
+                0x200 + u32::try_from(index).map_err(|_| PstError::IntegerConversion)?,
+            )?)
+        };
+        let attachment_subnode = if let Some(data_node) = data_node {
+            let data_block = push_data_tree(blocks, next_bid, next_offset, attachment.data)?;
+            Some(push_block(
+                blocks,
+                next_bid,
+                next_offset,
+                true,
+                NewBlockData::SubNodes(vec![UnicodeLeafSubNodeTreeEntry::new(
+                    data_node, data_block, None,
+                )]),
+            )?)
+        } else {
+            None
+        };
         let attachment_block = push_block(
             blocks,
             next_bid,
@@ -1886,7 +1939,7 @@ fn push_attachments(
         sub_nodes.push(UnicodeLeafSubNodeTreeEntry::new(
             attachment_id,
             attachment_block,
-            Some(attachment_subnode),
+            attachment_subnode,
         ));
     }
     Ok(())
@@ -1947,18 +2000,7 @@ fn create_unicode_pst(
     ])?;
     let inbox_data = inbox_data(1)?;
 
-    let inline_message_data = message_data(input, None, !attachments.is_empty())?;
-    let body_node = (inline_message_data.len()
-        > usize::from(ndb::block::MAX_BLOCK_SIZE - UnicodeBlockTrailer::SIZE))
-    .then(|| NodeId::new(NodeIdType::Internal, 0x80))
-    .transpose()?;
-    let message_data = if body_node.is_some() {
-        message_data(input, body_node, !attachments.is_empty())?
-    } else {
-        inline_message_data
-    };
-    let recipient_data =
-        recipient_table_data(recipient_table, input.recipient_name, input.recipient_email)?;
+    let (message_pages, message_properties) = message_data(input, !attachments.is_empty())?;
 
     let seeds = vec![
         (NID_MESSAGE_STORE, None, store_data),
@@ -1966,15 +2008,12 @@ fn create_unicode_pst(
         (ipm_hierarchy, None, table_context_data(&[inbox])?),
         (inbox, Some(ipm_subtree), inbox_data),
         (inbox_contents, None, table_context_data(&[message])?),
-        (message, Some(inbox), message_data),
-        (recipient_table, None, recipient_data),
     ];
     let mut blocks = Vec::new();
     let mut next_bid = 1;
     let mut next_offset = NEW_PST_DATA_OFFSET;
-    let mut recipient_block = None;
     for (node_id, parent, data) in seeds {
-        let block_id = push_block(
+        push_block(
             &mut blocks,
             &mut next_bid,
             &mut next_offset,
@@ -1982,26 +2021,28 @@ fn create_unicode_pst(
             NewBlockData::Data(data),
         )?;
         blocks.last_mut().unwrap().node = Some((node_id, parent, None));
-        if node_id == recipient_table {
-            recipient_block = Some(block_id);
-        }
     }
+    let message_block =
+        push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, message_pages)?;
+    blocks
+        .iter_mut()
+        .find(|block| block.id == message_block)
+        .unwrap()
+        .node = Some((message, Some(inbox), None));
+    let (recipient_block, recipient_subnodes) = push_recipient_table(
+        &mut blocks,
+        &mut next_bid,
+        &mut next_offset,
+        input.recipients,
+    )?;
     let mut sub_node_entries = vec![UnicodeLeafSubNodeTreeEntry::new(
         recipient_table,
-        recipient_block.unwrap(),
-        None,
+        recipient_block,
+        recipient_subnodes,
     )];
-
-    if let Some(body_node) = body_node {
-        let body_block = push_data_tree(
-            &mut blocks,
-            &mut next_bid,
-            &mut next_offset,
-            &utf16_bytes(input.body),
-        )?;
-        sub_node_entries.push(UnicodeLeafSubNodeTreeEntry::new(
-            body_node, body_block, None,
-        ));
+    for (node, data) in message_properties {
+        let data = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &data)?;
+        sub_node_entries.push(UnicodeLeafSubNodeTreeEntry::new(node, data, None));
     }
 
     push_attachments(
@@ -2207,16 +2248,6 @@ fn append_unicode_pst(
     input: &UnicodePstMessage<'_>,
     attachments: &[UnicodePstAttachment<'_>],
 ) -> io::Result<()> {
-    if attachments
-        .iter()
-        .any(|attachment| attachment.data.is_empty())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "empty attachments are not supported",
-        ));
-    }
-
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let mut header = UnicodeHeader::read(&mut file)?;
     if header.crypt_method() != NdbCryptMethod::None {
@@ -2312,32 +2343,14 @@ fn append_unicode_pst(
     let mut next_offset = old_root.file_eof_index().index();
     let mut blocks = Vec::new();
 
-    let inline_message_data = message_data(input, None, !attachments.is_empty())?;
-    let body_node = (inline_message_data.len() > MAX_DATA_BLOCK_SIZE)
-        .then(|| NodeId::new(NodeIdType::Internal, 0x80))
-        .transpose()?;
-    let message_data = if body_node.is_some() {
-        message_data(input, body_node, !attachments.is_empty())?
-    } else {
-        inline_message_data
-    };
-    let message_bid = push_block(
+    let (message_pages, message_properties) = message_data(input, !attachments.is_empty())?;
+    let message_bid =
+        push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, message_pages)?;
+    let (recipient_bid, recipient_subnodes) = push_recipient_table(
         &mut blocks,
         &mut next_bid,
         &mut next_offset,
-        false,
-        NewBlockData::Data(message_data),
-    )?;
-    let recipient_bid = push_block(
-        &mut blocks,
-        &mut next_bid,
-        &mut next_offset,
-        false,
-        NewBlockData::Data(recipient_table_data(
-            recipient_table,
-            input.recipient_name,
-            input.recipient_email,
-        )?),
+        input.recipients,
     )?;
 
     let (contents_heap, row_chunks, row_ids) = rebuild_contents_table(
@@ -2403,16 +2416,11 @@ fn append_unicode_pst(
     let mut message_subnodes = vec![UnicodeLeafSubNodeTreeEntry::new(
         recipient_table,
         recipient_bid,
-        None,
+        recipient_subnodes,
     )];
-    if let Some(body_node) = body_node {
-        let body_bid = push_data_tree(
-            &mut blocks,
-            &mut next_bid,
-            &mut next_offset,
-            &utf16_bytes(input.body),
-        )?;
-        message_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(body_node, body_bid, None));
+    for (node, data) in message_properties {
+        let data = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &data)?;
+        message_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(node, data, None));
     }
     push_attachments(
         &mut blocks,
@@ -2503,6 +2511,54 @@ mod create_tests {
     use crate::messaging::attachment::{Attachment, AttachmentData, UnicodeAttachment};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const TEST_RECIPIENTS: &[UnicodePstRecipient<'static>] = &[
+        UnicodePstRecipient {
+            name: "to recipient",
+            email: "to@example.com",
+            recipient_type: UnicodePstRecipientType::To,
+        },
+        UnicodePstRecipient {
+            name: "cc recipient",
+            email: "cc@example.com",
+            recipient_type: UnicodePstRecipientType::Cc,
+        },
+        UnicodePstRecipient {
+            name: "bcc recipient",
+            email: "bcc@example.com",
+            recipient_type: UnicodePstRecipientType::Bcc,
+        },
+    ];
+
+    fn last_inbox_message(path: &Path) -> Rc<dyn Message> {
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(path).unwrap())).unwrap();
+        let ipm = store
+            .open_folder(&store.properties().ipm_sub_tree_entry_id().unwrap())
+            .unwrap();
+        let inbox_id = NodeId::from(u32::from(
+            ipm.hierarchy_table()
+                .unwrap()
+                .rows_matrix()
+                .next()
+                .unwrap()
+                .id(),
+        ));
+        let inbox = store
+            .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
+            .unwrap();
+        let message_id = NodeId::from(u32::from(
+            inbox
+                .contents_table()
+                .unwrap()
+                .rows_matrix()
+                .last()
+                .unwrap()
+                .id(),
+        ));
+        store
+            .open_message(&store.properties().make_entry_id(message_id).unwrap(), None)
+            .unwrap()
+    }
+
     #[test]
     fn creates_a_reopenable_unicode_pst_with_one_message() {
         let stamp = SystemTime::now()
@@ -2518,9 +2574,9 @@ mod create_tests {
             subject: "Memex PST export",
             sender_name: "Memex Sender",
             sender_email: "sender@example.com",
-            recipient_name: "Memex Recipient",
-            recipient_email: "recipient@example.com",
+            recipients: TEST_RECIPIENTS,
             body: "Hello from Memex PST export.",
+            html_body: None,
             message_id: "<memex-pst-export@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
@@ -2610,23 +2666,89 @@ mod create_tests {
         }
 
         let recipients = message.recipient_table().unwrap();
-        let row = recipients.rows_matrix().next().unwrap();
-        let values = row.columns(recipients.context()).unwrap();
-        let smtp_column = recipients
-            .context()
-            .columns()
-            .iter()
-            .zip(values)
-            .find(|(column, _)| column.prop_id() == 0x39FE)
-            .unwrap();
-        let smtp = recipients
-            .read_column(smtp_column.1.as_ref().unwrap(), smtp_column.0.prop_type())
-            .unwrap();
-        match smtp {
-            PropertyValue::Unicode(value) => {
-                assert_eq!(value.to_string(), "recipient@example.com")
-            }
-            value => panic!("unexpected recipient value: {value:?}"),
+        let recipient_rows = recipients
+            .rows_matrix()
+            .map(|row| {
+                let values = row.columns(recipients.context()).unwrap();
+                let read = |id| {
+                    let (column, value) = recipients
+                        .context()
+                        .columns()
+                        .iter()
+                        .zip(&values)
+                        .find(|(column, _)| column.prop_id() == id)
+                        .unwrap();
+                    recipients
+                        .read_column(value.as_ref().unwrap(), column.prop_type())
+                        .unwrap()
+                };
+                let recipient_type = match read(0x0C15) {
+                    PropertyValue::Integer32(value) => value,
+                    value => panic!("unexpected recipient type: {value:?}"),
+                };
+                let smtp = match read(0x39FE) {
+                    PropertyValue::Unicode(value) => value.to_string(),
+                    value => panic!("unexpected recipient value: {value:?}"),
+                };
+                (recipient_type, smtp)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recipient_rows,
+            [
+                (1, "to@example.com".to_string()),
+                (2, "cc@example.com".to_string()),
+                (3, "bcc@example.com".to_string()),
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn writes_html_with_plain_text_fallback() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-html-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        let html = "<p>HTML 본문</p>".repeat(1_000);
+        let input = UnicodePstMessage {
+            subject: "HTML message",
+            sender_name: "sender",
+            sender_email: "sender@example.com",
+            recipients: TEST_RECIPIENTS,
+            body: "plain-text fallback",
+            html_body: Some(&html),
+            message_id: "<html@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+
+        drop(UnicodePstFile::create(&path, &input).unwrap());
+        drop(UnicodePstFile::append(&path, &input).unwrap());
+        let message = last_inbox_message(&path);
+        match message.properties().get(0x1000).unwrap() {
+            PropertyValue::Unicode(value) => assert_eq!(value.to_string(), input.body),
+            value => panic!("unexpected plain-text body: {value:?}"),
+        }
+        match message.properties().get(0x1013).unwrap() {
+            PropertyValue::Binary(value) => assert_eq!(value.buffer(), html.as_bytes()),
+            value => panic!("unexpected HTML body: {value:?}"),
+        }
+        drop(message);
+
+        let empty_html = UnicodePstMessage {
+            html_body: Some(""),
+            message_id: "<empty-html@example.com>",
+            ..input
+        };
+        drop(UnicodePstFile::append(&path, &empty_html).unwrap());
+        let message = last_inbox_message(&path);
+        match message.properties().get(0x1013).unwrap() {
+            PropertyValue::Binary(value) => assert!(value.buffer().is_empty()),
+            value => panic!("unexpected empty HTML body: {value:?}"),
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -2645,9 +2767,9 @@ mod create_tests {
             subject: "first",
             sender_name: "sender",
             sender_email: "sender@example.com",
-            recipient_name: "recipient",
-            recipient_email: "recipient@example.com",
+            recipients: TEST_RECIPIENTS,
             body: "first body",
+            html_body: None,
             message_id: "<first@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
@@ -2715,6 +2837,10 @@ mod create_tests {
                 let message = store
                     .open_message(&store.properties().make_entry_id(message_id).unwrap(), None)
                     .unwrap();
+                assert_eq!(
+                    message.recipient_table().unwrap().rows_matrix().count(),
+                    TEST_RECIPIENTS.len()
+                );
                 match message.properties().get(0x0037).unwrap() {
                     PropertyValue::Unicode(value) => value.to_string(),
                     value => panic!("unexpected subject value: {value:?}"),
@@ -2741,9 +2867,9 @@ mod create_tests {
             subject: "large",
             sender_name: "sender",
             sender_email: "sender@example.com",
-            recipient_name: "recipient",
-            recipient_email: "recipient@example.com",
+            recipients: TEST_RECIPIENTS,
             body: &body,
+            html_body: None,
             message_id: "<large@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
@@ -2912,9 +3038,9 @@ mod create_tests {
             subject: "message-0",
             sender_name: "sender",
             sender_email: "sender@example.com",
-            recipient_name: "recipient",
-            recipient_email: "recipient@example.com",
+            recipients: TEST_RECIPIENTS,
             body: "body",
+            html_body: None,
             message_id: "<message-0@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
@@ -2930,8 +3056,7 @@ mod create_tests {
             )
             .unwrap(),
         );
-
-        for index in 1..10 {
+        for index in 1..20 {
             let subject = format!("message-{index}");
             let message_id = format!("<message-{index}@example.com>");
             drop(
@@ -2975,8 +3100,8 @@ mod create_tests {
         let inbox = store
             .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
             .unwrap();
-        assert_eq!(inbox.properties().content_count().unwrap(), 10);
-        assert_eq!(inbox.contents_table().unwrap().rows_matrix().count(), 10);
+        assert_eq!(inbox.properties().content_count().unwrap(), 20);
+        assert_eq!(inbox.contents_table().unwrap().rows_matrix().count(), 20);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3035,9 +3160,9 @@ mod create_tests {
             subject: "appended to Outlook PST",
             sender_name: "sender",
             sender_email: "sender@example.com",
-            recipient_name: "recipient",
-            recipient_email: "recipient@example.com",
+            recipients: TEST_RECIPIENTS,
             body: "existing PST body",
+            html_body: None,
             message_id: "<existing-pst@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
@@ -3099,7 +3224,7 @@ mod create_tests {
     }
 
     #[test]
-    fn rejects_an_empty_attachment_without_creating_a_pst() {
+    fn writes_an_empty_attachment() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3112,25 +3237,83 @@ mod create_tests {
             subject: "empty attachment",
             sender_name: "sender",
             sender_email: "sender@example.com",
-            recipient_name: "recipient",
-            recipient_email: "recipient@example.com",
+            recipients: TEST_RECIPIENTS,
             body: "body",
+            html_body: None,
             message_id: "<empty-attachment@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
-        let error = UnicodePstFile::create_with_attachments(
-            &path,
-            &message,
-            &[UnicodePstAttachment {
-                filename: "empty.txt",
-                mime_type: "text/plain",
-                data: &[],
-            }],
+        drop(
+            UnicodePstFile::create_with_attachments(
+                &path,
+                &message,
+                &[UnicodePstAttachment {
+                    filename: "empty.txt",
+                    mime_type: "text/plain",
+                    data: &[],
+                }],
+            )
+            .unwrap(),
+        );
+        drop(
+            UnicodePstFile::append_with_attachments(
+                &path,
+                &message,
+                &[UnicodePstAttachment {
+                    filename: "empty.txt",
+                    mime_type: "text/plain",
+                    data: &[],
+                }],
+            )
+            .unwrap(),
+        );
+
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(&path).unwrap())).unwrap();
+        let ipm = store
+            .open_folder(&store.properties().ipm_sub_tree_entry_id().unwrap())
+            .unwrap();
+        let inbox_id = NodeId::from(u32::from(
+            ipm.hierarchy_table()
+                .unwrap()
+                .rows_matrix()
+                .next()
+                .unwrap()
+                .id(),
+        ));
+        let inbox = store
+            .open_folder(&store.properties().make_entry_id(inbox_id).unwrap())
+            .unwrap();
+        let message_id = NodeId::from(u32::from(
+            inbox
+                .contents_table()
+                .unwrap()
+                .rows_matrix()
+                .last()
+                .unwrap()
+                .id(),
+        ));
+        let message = UnicodeMessage::read(
+            store.clone(),
+            &store.properties().make_entry_id(message_id).unwrap(),
+            None,
         )
-        .err()
         .unwrap();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(!path.exists());
+        let attachment_id = NodeId::from(u32::from(
+            message
+                .attachment_table()
+                .unwrap()
+                .rows_matrix()
+                .next()
+                .unwrap()
+                .id(),
+        ));
+        let attachment = UnicodeAttachment::read(message, attachment_id, None).unwrap();
+        assert_eq!(attachment.properties().attachment_size().unwrap(), 0);
+        match attachment.data().unwrap() {
+            AttachmentData::Binary(value) => assert!(value.buffer().is_empty()),
+            AttachmentData::Message(_) => panic!("unexpected embedded message"),
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }
 
