@@ -13,6 +13,6 @@ cargo run -p outlook-pst-rw --example gen-fixture-pst -- fixture.pst
 cargo run -p outlook-pst-rw --example gen-fixture-pst -- stress.pst --stress
 ```
 
-`UnicodePstFile::append` adds messages to the default receive folder of an existing unencrypted Unicode PST without replacing existing messages. It preserves the folder property context, contents-table schema and rows, and existing subnodes. `create_with_attachments` and `append_with_attachments` write by-value attachments, including zero-byte files; large bodies, HTML, and attachment data use XBLOCK/XXBLOCK data trees. Multi-level BBT, NBT, and subnode trees and multiple AMap regions are supported.
+`UnicodePstFile::append` adds messages to the default receive folder of an existing unencrypted Unicode PST without replacing existing messages. It preserves the folder property context, contents-table schema and rows, and existing subnodes. `create_with_attachments` and `append_with_attachments` write by-value attachments, including zero-byte files. Setting an attachment's `content_id` writes the matching `PR_ATTACH_CONTENT_ID` and HTML-reference flag so `cid:` images can render inline. Large bodies, HTML, and attachment data use XBLOCK/XXBLOCK data trees. Multi-level BBT, NBT, and subnode trees and multiple AMap regions are supported.
 
 ANSI PST append and encoded/encrypted PSTs remain unsupported. Copy-on-write append currently retains superseded blocks, so repeated appends grow the file until a future compaction pass is implemented.

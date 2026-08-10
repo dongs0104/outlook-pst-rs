@@ -263,6 +263,9 @@ pub struct UnicodePstAttachment<'a> {
     pub filename: &'a str,
     /// MIME content type, such as `application/pdf`.
     pub mime_type: &'a str,
+    /// MIME Content-ID for an inline HTML attachment. Surrounding `<` and `>` are removed.
+    /// The HTML body must reference the normalized value with the `cid:` scheme.
+    pub content_id: Option<&'a str>,
     /// Exact attachment bytes.
     pub data: &'a [u8],
 }
@@ -1324,31 +1327,52 @@ fn attachment_data(
     data_node: Option<NodeId>,
 ) -> io::Result<Vec<u8>> {
     let size = i32::try_from(input.data.len()).map_err(|_| PstError::IntegerConversion)?;
+    let mut properties = vec![
+        (0x0E20, PropertyType::Integer32, None, size as u32),
+        (0x3701, PropertyType::Binary, None, 0),
+        (
+            0x3704,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.filename)),
+            0,
+        ),
+        (0x3705, PropertyType::Integer32, None, 1),
+        (
+            0x3707,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.filename)),
+            0,
+        ),
+        (0x370B, PropertyType::Integer32, None, u32::MAX),
+        (
+            0x370E,
+            PropertyType::Unicode,
+            Some(utf16_bytes(input.mime_type)),
+            0,
+        ),
+    ];
+    if let Some(content_id) = input.content_id {
+        let content_id = content_id.strip_prefix('<').unwrap_or(content_id);
+        let content_id = content_id.strip_suffix('>').unwrap_or(content_id);
+        if content_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment Content-ID must not be empty",
+            ));
+        }
+        properties.extend([
+            (
+                0x3712,
+                PropertyType::Unicode,
+                Some(utf16_bytes(content_id)),
+                0,
+            ),
+            // PidTagAttachFlags bit 0x4 marks an attachment as referenced by HTML.
+            (0x3714, PropertyType::Integer32, None, 0x0000_0004),
+        ]);
+    }
     property_context_data_with_nodes(
-        &[
-            (0x0E20, PropertyType::Integer32, None, size as u32),
-            (0x3701, PropertyType::Binary, None, 0),
-            (
-                0x3704,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.filename)),
-                0,
-            ),
-            (0x3705, PropertyType::Integer32, None, 1),
-            (
-                0x3707,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.filename)),
-                0,
-            ),
-            (0x370B, PropertyType::Integer32, None, u32::MAX),
-            (
-                0x370E,
-                PropertyType::Unicode,
-                Some(utf16_bytes(input.mime_type)),
-                0,
-            ),
-        ],
+        &properties,
         &data_node.map(|node| [(0x3701, node)]).unwrap_or_default(),
     )
 }
@@ -2852,7 +2876,7 @@ mod create_tests {
     }
 
     #[test]
-    fn creates_and_appends_large_bodies_and_attachments() {
+    fn creates_and_appends_large_bodies_and_inline_attachments() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2869,13 +2893,14 @@ mod create_tests {
             sender_email: "sender@example.com",
             recipients: TEST_RECIPIENTS,
             body: &body,
-            html_body: None,
+            html_body: Some("<img src=\"cid:large-image@example.com\">"),
             message_id: "<large@example.com>",
             delivery_time: 133_750_080_000_000_000,
         };
         let attachment = UnicodePstAttachment {
-            filename: "large.bin",
-            mime_type: "application/octet-stream",
+            filename: "large.png",
+            mime_type: "image/png",
+            content_id: Some("<large-image@example.com>"),
             data: &attachment_bytes,
         };
 
@@ -2928,15 +2953,23 @@ mod create_tests {
         let attachment = UnicodeAttachment::read(message, attachment_id, None).unwrap();
         assert_eq!(attachment.properties().attachment_size().unwrap(), 9_000);
         match attachment.properties().get(0x3707).unwrap() {
-            PropertyValue::Unicode(value) => assert_eq!(value.to_string(), "large.bin"),
+            PropertyValue::Unicode(value) => assert_eq!(value.to_string(), "large.png"),
             value => panic!("unexpected attachment filename: {value:?}"),
         }
         match attachment.properties().get(0x370E).unwrap() {
-            PropertyValue::Unicode(value) => {
-                assert_eq!(value.to_string(), "application/octet-stream")
-            }
+            PropertyValue::Unicode(value) => assert_eq!(value.to_string(), "image/png"),
             value => panic!("unexpected attachment MIME type: {value:?}"),
         }
+        match attachment.properties().get(0x3712).unwrap() {
+            PropertyValue::Unicode(value) => {
+                assert_eq!(value.to_string(), "large-image@example.com")
+            }
+            value => panic!("unexpected attachment Content-ID: {value:?}"),
+        }
+        assert!(matches!(
+            attachment.properties().get(0x3714),
+            Some(PropertyValue::Integer32(0x0000_0004))
+        ));
         match attachment.data().unwrap() {
             AttachmentData::Binary(value) => assert_eq!(value.buffer(), attachment_bytes),
             AttachmentData::Message(_) => panic!("unexpected embedded message"),
@@ -2960,8 +2993,9 @@ mod create_tests {
                 &path,
                 &input,
                 &[UnicodePstAttachment {
-                    filename: "large.bin",
-                    mime_type: "application/octet-stream",
+                    filename: "large.png",
+                    mime_type: "image/png",
+                    content_id: Some("large-image@example.com"),
                     data: &attachment_bytes,
                 }],
             )
@@ -3012,6 +3046,16 @@ mod create_tests {
                 .id(),
         ));
         let attachment = UnicodeAttachment::read(message, attachment_id, None).unwrap();
+        match attachment.properties().get(0x3712).unwrap() {
+            PropertyValue::Unicode(value) => {
+                assert_eq!(value.to_string(), "large-image@example.com")
+            }
+            value => panic!("unexpected attachment Content-ID: {value:?}"),
+        }
+        assert!(matches!(
+            attachment.properties().get(0x3714),
+            Some(PropertyValue::Integer32(0x0000_0004))
+        ));
         match attachment.data().unwrap() {
             AttachmentData::Binary(value) => assert_eq!(value.buffer(), attachment_bytes),
             AttachmentData::Message(_) => panic!("unexpected embedded message"),
@@ -3021,6 +3065,21 @@ mod create_tests {
         drop(ipm);
         drop(store);
         std::fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            attachment_data(
+                &UnicodePstAttachment {
+                    filename: "invalid.png",
+                    mime_type: "image/png",
+                    content_id: Some("<>"),
+                    data: &[],
+                },
+                None,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -3051,6 +3110,7 @@ mod create_tests {
                 &[UnicodePstAttachment {
                     filename: "large.bin",
                     mime_type: "application/octet-stream",
+                    content_id: None,
                     data: &large_attachment,
                 }],
             )
@@ -3250,6 +3310,7 @@ mod create_tests {
                 &[UnicodePstAttachment {
                     filename: "empty.txt",
                     mime_type: "text/plain",
+                    content_id: None,
                     data: &[],
                 }],
             )
@@ -3262,6 +3323,7 @@ mod create_tests {
                 &[UnicodePstAttachment {
                     filename: "empty.txt",
                     mime_type: "text/plain",
+                    content_id: None,
                     data: &[],
                 }],
             )
