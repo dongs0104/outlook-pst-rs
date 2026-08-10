@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-08-11
+
+### Added
+
+- create and append messages in case-insensitive nested folder paths, creating missing folders
+- write hierarchy, contents, and associated-contents nodes for newly created folders
+
 ## [1.2.4] - 2026-08-10
 
 ### Added
