@@ -105,6 +105,15 @@ fn main() -> io::Result<()> {
             &[inline_attachment],
         )?);
     }
+    drop(UnicodePstFile::append_in_folder(
+        &path,
+        &["Imported", "2026"],
+        &UnicodePstMessage {
+            subject: "Message in Imported/2026",
+            message_id: "<memex-folder-message@example.com>",
+            ..message
+        },
+    )?);
     println!("{}", path.display());
     Ok(())
 }
