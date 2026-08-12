@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-08-12
+
+### Fixed
+
+- reserve periodic FPMap pages so Unicode PST creation remains valid beyond 2 GiB
+
 ## [1.2.5] - 2026-08-11
 
 ### Added
