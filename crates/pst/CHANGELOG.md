@@ -7,11 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.2.6] - 2026-08-12
+## [1.2.6] - 2026-08-13
+
+### Added
+
+- bulk append APIs that stream message blocks and rebuild PST indexes once per batch
+- message position, Message-ID, and current PST size in bulk-write errors
 
 ### Fixed
 
 - reserve periodic FPMap pages so Unicode PST creation remains valid beyond 2 GiB
+- build multi-level BBT/NBT/subnode trees without invalid `cEntMax` page headers
+- keep only reachable blocks and recompute BBT reference counts after each commit
+- preserve Outlook folder table allocations and update search records when adding folders/messages
+- write Outlook-compatible recipient, attachment, contents-table, and message-size metadata
 
 ## [1.2.5] - 2026-08-11
 

@@ -85,19 +85,23 @@ fn main() -> io::Result<()> {
             &message,
             &[inline_attachment, attachment, empty_attachment],
         )?);
-        for index in 1..10 {
-            let subject = format!("Appended message {index}");
-            let message_id = format!("<append-{index}@example.com>");
-            drop(UnicodePstFile::append(
-                &path,
-                &UnicodePstMessage {
-                    subject: &subject,
-                    message_id: &message_id,
-                    body: "Incrementally appended body.",
-                    ..message
-                },
-            )?);
-        }
+        let subjects = (1..10)
+            .map(|index| format!("Appended message {index}"))
+            .collect::<Vec<_>>();
+        let message_ids = (1..10)
+            .map(|index| format!("<append-{index}@example.com>"))
+            .collect::<Vec<_>>();
+        let messages = subjects
+            .iter()
+            .zip(&message_ids)
+            .map(|(subject, message_id)| UnicodePstMessage {
+                subject,
+                message_id,
+                body: "Incrementally appended body.",
+                ..message
+            })
+            .collect::<Vec<_>>();
+        drop(UnicodePstFile::append_many(&path, &messages)?);
     } else {
         drop(UnicodePstFile::create_with_attachments(
             &path,

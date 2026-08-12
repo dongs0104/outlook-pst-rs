@@ -506,6 +506,8 @@ impl HeapNodePageReadWrite for HeapNodePageMap {
 pub trait HeapNode {
     fn header(&self) -> io::Result<HeapNodeHeader>;
     fn find_entry(&self, heap_id: HeapId) -> io::Result<&[u8]>;
+    #[doc(hidden)]
+    fn writer_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>>;
 }
 
 struct HeapNodeInner<Pst>
@@ -610,6 +612,33 @@ where
         let end = start + alloc.size() as usize;
         Ok(&block[start..end])
     }
+
+    fn writer_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
+        self.data
+            .iter()
+            .enumerate()
+            .map(|(block_index, block)| {
+                let data = block.data();
+                let mut cursor = Cursor::new(data);
+                let page_map_offset = match block_index {
+                    0 => HeapNodeHeader::read(&mut cursor)?.page_map_offset(),
+                    bitmap if bitmap % 128 == 8 => {
+                        HeapNodeBitmapHeader::read(&mut cursor)?.page_map_offset()
+                    }
+                    _ => HeapNodePageHeader::read(&mut cursor)?.page_map_offset(),
+                };
+                cursor.seek(SeekFrom::Start(u64::from(page_map_offset)))?;
+                let page_map = HeapNodePageMap::read(&mut cursor)?;
+                let mut allocations = vec![Vec::new()];
+                allocations.extend(page_map.allocations().iter().map(|allocation| {
+                    let start = usize::from(allocation.offset());
+                    let end = start + usize::from(allocation.size());
+                    data[start..end].to_vec()
+                }));
+                Ok(allocations)
+            })
+            .collect()
+    }
 }
 
 pub struct UnicodeHeapNode {
@@ -623,6 +652,10 @@ impl HeapNode for UnicodeHeapNode {
 
     fn find_entry(&self, heap_id: HeapId) -> io::Result<&[u8]> {
         self.inner.find_entry(heap_id)
+    }
+
+    fn writer_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
+        self.inner.writer_pages()
     }
 }
 
@@ -650,6 +683,10 @@ impl HeapNode for AnsiHeapNode {
 
     fn find_entry(&self, heap_id: HeapId) -> io::Result<&[u8]> {
         self.inner.find_entry(heap_id)
+    }
+
+    fn writer_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
+        self.inner.writer_pages()
     }
 }
 

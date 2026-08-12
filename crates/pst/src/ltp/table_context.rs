@@ -599,6 +599,13 @@ impl TableRowData {
         self.unique
     }
 
+    #[doc(hidden)]
+    pub fn writer_data(&self) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.write(&mut data)?;
+        Ok(data)
+    }
+
     pub fn columns(
         &self,
         context: &TableContextInfo,
@@ -832,6 +839,8 @@ pub trait TableContext {
         value: &TableRowColumnValue,
         prop_type: PropertyType,
     ) -> io::Result<PropertyValue>;
+    #[doc(hidden)]
+    fn writer_heap_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>>;
 }
 
 struct TableContextInner<Pst, RowIndex, RowIndexTree>
@@ -1096,6 +1105,10 @@ impl TableContext for UnicodeTableContext {
     ) -> io::Result<PropertyValue> {
         self.inner.read_column(value, prop_type)
     }
+
+    fn writer_heap_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
+        self.inner.heap.writer_pages()
+    }
 }
 
 impl TableContextReadWrite<UnicodePstFile> for UnicodeTableContext {
@@ -1151,6 +1164,10 @@ impl TableContext for AnsiTableContext {
         prop_type: PropertyType,
     ) -> io::Result<PropertyValue> {
         self.inner.read_column(value, prop_type)
+    }
+
+    fn writer_heap_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
+        self.inner.heap.writer_pages()
     }
 }
 

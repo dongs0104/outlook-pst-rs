@@ -1362,6 +1362,10 @@ impl UnicodeBlockBTreeEntry {
             ..Default::default()
         }
     }
+
+    pub(crate) fn set_ref_count(&mut self, ref_count: u16) {
+        self.ref_count = ref_count;
+    }
 }
 
 impl BTreeEntry for UnicodeBlockBTreeEntry {
