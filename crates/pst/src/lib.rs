@@ -673,7 +673,8 @@ fn finish_heap(
     user_root: HeapId,
 ) -> io::Result<Vec<u8>> {
     const HEAP_HEADER_SIZE: usize = 12;
-    let page_map_offset = allocations.iter().map(Vec::len).sum::<usize>() + HEAP_HEADER_SIZE;
+    let page_map_offset =
+        (allocations.iter().map(Vec::len).sum::<usize>() + HEAP_HEADER_SIZE).next_multiple_of(2);
     let page_map_offset =
         u16::try_from(page_map_offset).map_err(|_| PstError::IntegerConversion)?;
     let header = HeapNodeHeader::new(
@@ -692,6 +693,7 @@ fn finish_heap(
         offsets.push(u16::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?);
     }
 
+    data.resize(usize::from(page_map_offset), 0);
     data.write_u16::<byteorder::LittleEndian>(
         u16::try_from(offsets.len() - 1).map_err(|_| PstError::IntegerConversion)?,
     )?;
@@ -739,9 +741,9 @@ impl HeapBuilder {
         let fits = |page: usize, allocations: &[Vec<u8>]| {
             let allocation_bytes = allocations.iter().map(Vec::len).sum::<usize>() + data.len();
             let allocation_count = allocations.len() + 1;
-            Self::header_size(page) + allocation_bytes + 4 + 2 * (allocation_count + 1)
-                + 2 // reserve one page-map entry so a non-final page can be filled
-                <= MAX_DATA_BLOCK_SIZE
+            // Leave one byte for alignment after reserving a non-final page's padding entry.
+            Self::header_size(page) + allocation_bytes + 4 + 2 * (allocation_count + 1) + 2
+                < MAX_DATA_BLOCK_SIZE
         };
         if !fits(page, &self.pages[page]) {
             self.pages.push(vec![Vec::new()]);
@@ -791,8 +793,9 @@ impl HeapBuilder {
                         ));
                     }
                 }
-                let page_map_offset =
-                    header_size + allocations.iter().skip(1).map(Vec::len).sum::<usize>();
+                let page_map_offset = (header_size
+                    + allocations.iter().skip(1).map(Vec::len).sum::<usize>())
+                .next_multiple_of(2);
                 let page_map_offset =
                     u16::try_from(page_map_offset).map_err(|_| PstError::IntegerConversion)?;
                 let mut header = Vec::with_capacity(header_size);
@@ -820,6 +823,7 @@ impl HeapBuilder {
                     offsets
                         .push(u16::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?);
                 }
+                data.resize(usize::from(page_map_offset), 0);
                 data.write_u16::<byteorder::LittleEndian>(
                     u16::try_from(offsets.len() - 1).map_err(|_| PstError::IntegerConversion)?,
                 )?;
@@ -2216,21 +2220,18 @@ fn push_data_tree_chunks(
     for chunk in chunks.iter_mut().take(intermediate_count) {
         chunk.resize(MAX_DATA_BLOCK_SIZE, 0);
     }
-    let total_size = chunks.iter().try_fold(0_u32, |total, chunk| {
-        total
-            .checked_add(u32::try_from(chunk.len()).map_err(|_| PstError::IntegerConversion)?)
-            .ok_or(PstError::IntegerConversion)
-    })?;
     let mut ids = chunks
         .into_iter()
         .map(|chunk| {
-            push_block(
+            let size = u32::try_from(chunk.len()).map_err(|_| PstError::IntegerConversion)?;
+            let id = push_block(
                 blocks,
                 next_bid,
                 next_offset,
                 false,
                 NewBlockData::Data(chunk),
-            )
+            )?;
+            Ok((id, size))
         })
         .collect::<io::Result<Vec<_>>>()?;
     let mut level = 1;
@@ -2238,7 +2239,10 @@ fn push_data_tree_chunks(
         ids = ids
             .chunks(1021)
             .map(|entries| {
-                push_block(
+                let total_size = entries.iter().try_fold(0_u32, |total, (_, size)| {
+                    total.checked_add(*size).ok_or(PstError::IntegerConversion)
+                })?;
+                let id = push_block(
                     blocks,
                     next_bid,
                     next_offset,
@@ -2246,18 +2250,18 @@ fn push_data_tree_chunks(
                     NewBlockData::DataTree(
                         entries
                             .iter()
-                            .copied()
-                            .map(UnicodeDataTreeEntry::from)
+                            .map(|(id, _)| UnicodeDataTreeEntry::from(*id))
                             .collect(),
                         level,
                         total_size,
                     ),
-                )
+                )?;
+                Ok((id, total_size))
             })
             .collect::<io::Result<Vec<_>>>()?;
         level += 1;
     }
-    Ok(ids[0])
+    Ok(ids[0].0)
 }
 
 fn push_recipient_table(
@@ -3901,6 +3905,74 @@ mod create_tests {
     }
 
     #[test]
+    fn writes_local_totals_for_multilevel_data_trees() {
+        let mut blocks = Vec::new();
+        let mut next_bid = 1;
+        let mut next_offset = AMAP_FIRST_OFFSET;
+        let root = push_data_tree_chunks(
+            &mut blocks,
+            &mut next_bid,
+            &mut next_offset,
+            (0..1_022).map(|_| vec![0x5A]),
+        )
+        .unwrap();
+
+        let trees = blocks
+            .iter()
+            .filter_map(|block| match &block.data {
+                NewBlockData::DataTree(entries, level, total_size) => {
+                    Some((block.id, *level, entries.len(), *total_size))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let full_group_size = 1_021 * u32::try_from(MAX_DATA_BLOCK_SIZE).unwrap();
+        assert_eq!(trees.len(), 3);
+        assert_eq!(
+            (trees[0].1, trees[0].2, trees[0].3),
+            (1, 1_021, full_group_size)
+        );
+        assert_eq!((trees[1].1, trees[1].2, trees[1].3), (1, 1, 1));
+        assert_eq!(
+            (trees[2].1, trees[2].2, trees[2].3),
+            (2, 2, full_group_size + 1)
+        );
+        assert_eq!(root, trees[2].0);
+    }
+
+    #[test]
+    fn aligns_heap_page_maps_to_two_bytes() {
+        let data = finish_heap(
+            vec![Vec::new(), vec![0x5A]],
+            HeapNodeType::Properties,
+            heap_id(1).unwrap(),
+        )
+        .unwrap();
+        let mut cursor = Cursor::new(&data);
+        let page_map_offset = HeapNodeHeader::read(&mut cursor).unwrap().page_map_offset();
+        assert_eq!(page_map_offset % 2, 0);
+        cursor
+            .seek(SeekFrom::Start(u64::from(page_map_offset)))
+            .unwrap();
+        HeapNodePageMap::read(&mut cursor).unwrap();
+        assert_eq!(cursor.position() as usize, data.len());
+
+        let mut heap = HeapBuilder::new();
+        heap.alloc(vec![0x5A]).unwrap();
+        let pages = heap
+            .finish(HeapNodeType::Properties, HeapId::default())
+            .unwrap();
+        let mut cursor = Cursor::new(&pages[0]);
+        let page_map_offset = HeapNodeHeader::read(&mut cursor).unwrap().page_map_offset();
+        assert_eq!(page_map_offset % 2, 0);
+        cursor
+            .seek(SeekFrom::Start(u64::from(page_map_offset)))
+            .unwrap();
+        HeapNodePageMap::read(&mut cursor).unwrap();
+        assert_eq!(cursor.position() as usize, pages[0].len());
+    }
+
+    #[test]
     fn fills_nonfinal_heap_pages_with_a_padding_allocation() {
         let mut heap = HeapBuilder::new();
         for _ in 0..100 {
@@ -3914,6 +3986,7 @@ mod create_tests {
         assert_eq!(pages[0].len(), MAX_DATA_BLOCK_SIZE);
         let mut cursor = Cursor::new(&pages[0]);
         let page_map_offset = HeapNodeHeader::read(&mut cursor).unwrap().page_map_offset();
+        assert_eq!(page_map_offset % 2, 0);
         cursor
             .seek(SeekFrom::Start(u64::from(page_map_offset)))
             .unwrap();
