@@ -648,7 +648,8 @@ const FPMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_PAGE_COUNT;
 
 const MAX_DATA_BLOCK_SIZE: usize =
     (ndb::block::MAX_BLOCK_SIZE - UnicodeBlockTrailer::SIZE) as usize;
-const MAX_HEAP_ALLOCATION_SIZE: usize = MAX_DATA_BLOCK_SIZE - 12;
+// Largest value that fits on an empty continuation HN page with its aligned page map.
+const MAX_HEAP_ALLOCATION_SIZE: usize = MAX_DATA_BLOCK_SIZE - 15;
 
 const OUTLOOK_UNICODE_PST_TEMPLATE: &[u8] = include_bytes!("../examples/Empty.pst");
 
@@ -4927,6 +4928,40 @@ mod create_tests {
             NodeId::new(NodeIdType::Internal, 0x300).unwrap()
         );
         assert_eq!(external[0].1, value);
+    }
+
+    #[test]
+    fn externalizes_unicode_body_at_heap_page_boundary() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-boundary-body-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        let body = "A".repeat(4_081);
+        assert_eq!(body.encode_utf16().count() * 2, 8_162);
+        assert_eq!(utf16_bytes(&body).len(), 8_164);
+        let input = UnicodePstMessage {
+            subject: "boundary body",
+            sender_name: "sender",
+            sender_email: "sender@example.com",
+            recipients: TEST_RECIPIENTS,
+            body: &body,
+            html_body: None,
+            message_id: "<boundary-body@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+
+        drop(UnicodePstFile::create(&path, &input).unwrap());
+        let message = last_inbox_message(&path);
+        match message.properties().get(0x1000).unwrap() {
+            PropertyValue::Unicode(value) => assert_eq!(value.to_string(), body),
+            value => panic!("unexpected body value: {value:?}"),
+        }
+        drop(message);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
