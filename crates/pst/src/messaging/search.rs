@@ -219,6 +219,13 @@ pub struct SearchUpdate {
 }
 
 impl SearchUpdate {
+    pub(crate) fn new(data: SearchUpdateData) -> Self {
+        Self {
+            flags: SearchUpdateFlags::None as u16,
+            data: Some(data),
+        }
+    }
+
     pub fn flags(&self) -> u16 {
         self.flags
     }

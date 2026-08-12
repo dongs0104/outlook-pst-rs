@@ -128,19 +128,6 @@ impl UnicodeHeader {
         }
     }
 
-    pub(crate) fn new_file(
-        root: UnicodeRoot,
-        crypt_method: NdbCryptMethod,
-        next_page: UnicodePageId,
-        next_block: UnicodeBlockId,
-    ) -> Self {
-        Self {
-            next_page,
-            next_block,
-            ..Self::new(root, crypt_method)
-        }
-    }
-
     pub(crate) fn set_next_block(&mut self, next_block: UnicodeBlockId) {
         self.next_block = next_block;
     }
@@ -149,7 +136,6 @@ impl UnicodeHeader {
         self.next_page = next_page;
     }
 
-    #[cfg(test)]
     pub(crate) fn set_crypt_method(&mut self, crypt_method: NdbCryptMethod) {
         self.crypt_method = crypt_method;
     }

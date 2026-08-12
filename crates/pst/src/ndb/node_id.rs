@@ -223,6 +223,12 @@ pub const NID_RESERVED3: NodeId = NodeId(0x301);
 /// Search Gatherer Folder Queue (section [2.4.8.5.3](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5dd87c45-5f2d-4945-b7e3-2612bd1a94d3)).
 pub const NID_SEARCH_GATHERER_FOLDER_QUEUE: NodeId = NodeId(0x321);
 
+/// Fixed Recipient Table subnode NID inside each Message object.
+pub const NID_RECIPIENT_TABLE: NodeId = NodeId(0x692);
+
+/// Fixed Attachment Table subnode NID inside each Message object.
+pub const NID_ATTACHMENT_TABLE: NodeId = NodeId(0x671);
+
 #[cfg(test)]
 mod tests {
     use super::*;
