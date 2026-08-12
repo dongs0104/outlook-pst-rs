@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.7] - 2026-08-13
+
+### Fixed
+
+- externalize oversized folder contents values such as `PR_DISPLAY_TO`
+- align HN page maps and encode each multi-level XBLOCK with its local subtree size
+
 ## [1.2.6] - 2026-08-13
 
 ### Added
