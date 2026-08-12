@@ -740,6 +740,7 @@ impl HeapBuilder {
             let allocation_bytes = allocations.iter().map(Vec::len).sum::<usize>() + data.len();
             let allocation_count = allocations.len() + 1;
             Self::header_size(page) + allocation_bytes + 4 + 2 * (allocation_count + 1)
+                + 2 // reserve one page-map entry so a non-final page can be filled
                 <= MAX_DATA_BLOCK_SIZE
         };
         if !fits(page, &self.pages[page]) {
@@ -763,11 +764,33 @@ impl HeapBuilder {
     }
 
     fn finish(self, client_signature: HeapNodeType, user_root: HeapId) -> io::Result<Vec<Vec<u8>>> {
+        let page_count = self.pages.len();
         self.pages
             .into_iter()
             .enumerate()
             .map(|(page, mut allocations)| {
                 let header_size = Self::header_size(page);
+                if page + 1 < page_count {
+                    let allocations_end =
+                        header_size + allocations.iter().skip(1).map(Vec::len).sum::<usize>();
+                    let encoded_size = allocations_end + 4 + 2 * allocations.len();
+                    if encoded_size < MAX_DATA_BLOCK_SIZE {
+                        let padding = MAX_DATA_BLOCK_SIZE
+                            .checked_sub(encoded_size + 2)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "heap page has no room for a padding allocation",
+                                )
+                            })?;
+                        allocations.push(vec![0; padding]);
+                    } else if encoded_size > MAX_DATA_BLOCK_SIZE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "encoded heap page exceeds one Unicode PST data block",
+                        ));
+                    }
+                }
                 let page_map_offset =
                     header_size + allocations.iter().skip(1).map(Vec::len).sum::<usize>();
                 let page_map_offset =
@@ -800,7 +823,13 @@ impl HeapBuilder {
                 data.write_u16::<byteorder::LittleEndian>(
                     u16::try_from(offsets.len() - 1).map_err(|_| PstError::IntegerConversion)?,
                 )?;
-                data.write_u16::<byteorder::LittleEndian>(0)?;
+                let free_count = offsets
+                    .windows(2)
+                    .filter(|offsets| offsets[0] == offsets[1])
+                    .count();
+                data.write_u16::<byteorder::LittleEndian>(
+                    u16::try_from(free_count).map_err(|_| PstError::IntegerConversion)?,
+                )?;
                 for offset in offsets {
                     data.write_u16::<byteorder::LittleEndian>(offset)?;
                 }
@@ -916,6 +945,7 @@ enum TableCell {
 }
 
 type RebuiltTable = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<NodeId>);
+type RebuiltContentsTable = (RebuiltTable, Vec<(NodeId, Vec<u8>)>);
 
 fn table_pointer_type(prop_type: PropertyType) -> bool {
     matches!(
@@ -1357,14 +1387,16 @@ fn rebuild_contents_table(
     messages: &[NodeId],
     message_sizes: &[i32],
     rows_node: NodeId,
+    mut next_subnode_index: u32,
     row_version: u32,
-) -> io::Result<RebuiltTable> {
+) -> io::Result<RebuiltContentsTable> {
+    let mut external = Vec::new();
     let rows = inputs
         .iter()
         .zip(messages)
         .zip(message_sizes)
         .map(|((input, message), message_size)| {
-            let cells = table
+            let mut cells = table
                 .context()
                 .columns()
                 .iter()
@@ -1381,10 +1413,26 @@ fn rebuild_contents_table(
                     )
                 })
                 .collect::<io::Result<Vec<_>>>()?;
+            for cell in cells.iter_mut().flatten() {
+                let TableCell::Bytes(data) = cell else {
+                    continue;
+                };
+                if data.len() > MAX_HEAP_ALLOCATION_SIZE {
+                    let node = NodeId::new(NodeIdType::Internal, next_subnode_index)?;
+                    next_subnode_index = next_subnode_index
+                        .checked_add(1)
+                        .ok_or(PstError::IntegerConversion)?;
+                    external.push((node, std::mem::take(data)));
+                    *cell = TableCell::Node(node);
+                }
+            }
             Ok((*message, cells))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    rebuild_table_with_rows_and_version(table, rows, Some(rows_node), row_version)
+    Ok((
+        rebuild_table_with_rows_and_version(table, rows, Some(rows_node), row_version)?,
+        external,
+    ))
 }
 
 fn property_context_data(
@@ -2151,7 +2199,7 @@ fn push_data_tree_chunks(
     next_offset: &mut u64,
     chunks: impl IntoIterator<Item = Vec<u8>>,
 ) -> io::Result<UnicodeBlockId> {
-    let chunks = chunks.into_iter().collect::<Vec<_>>();
+    let mut chunks = chunks.into_iter().collect::<Vec<_>>();
     if chunks.is_empty() || chunks.iter().any(Vec::is_empty) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2163,6 +2211,10 @@ fn push_data_tree_chunks(
             io::ErrorKind::InvalidInput,
             "data tree block exceeds the Unicode PST block limit",
         ));
+    }
+    let intermediate_count = chunks.len().saturating_sub(1);
+    for chunk in chunks.iter_mut().take(intermediate_count) {
+        chunk.resize(MAX_DATA_BLOCK_SIZE, 0);
     }
     let total_size = chunks.iter().try_fold(0_u32, |total, chunk| {
         total
@@ -3466,7 +3518,16 @@ fn append_unicode_pst(
     }
     file.sync_data()?;
 
-    let (contents_heap, row_chunks, row_ids) = rebuild_contents_table(
+    let next_contents_subnode = contents_subnodes
+        .iter()
+        .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
+        .map(|entry| entry.node().index())
+        .max()
+        .unwrap_or(0)
+        .max(rows_node.index())
+        .checked_add(1)
+        .ok_or(PstError::IntegerConversion)?;
+    let ((contents_heap, row_chunks, row_ids), external_contents) = rebuild_contents_table(
         contents_table.as_ref(),
         inputs,
         store_record_key,
@@ -3474,6 +3535,7 @@ fn append_unicode_pst(
         &messages,
         &message_sizes,
         rows_node,
+        next_contents_subnode,
         header.unique_value(),
     )
     .map_err(|err| {
@@ -3488,6 +3550,10 @@ fn append_unicode_pst(
     let rows_bid = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, row_chunks)?;
     contents_subnodes.retain(|entry| entry.node() != rows_node);
     contents_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(rows_node, rows_bid, None));
+    for (node, data) in external_contents {
+        let data = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &data)?;
+        contents_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(node, data, None));
+    }
     let contents_subnode_bid = push_subnode_tree(
         &mut blocks,
         &mut next_bid,
@@ -3601,6 +3667,7 @@ fn append_unicode_pst(
 mod create_tests {
     use super::*;
     use crate::messaging::attachment::{Attachment, AttachmentData, UnicodeAttachment};
+    use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_RECIPIENTS: &[UnicodePstRecipient<'static>] = &[
@@ -3738,6 +3805,125 @@ mod create_tests {
             ]
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn externalizes_large_recipient_display_values_in_contents_table() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-large-display-to-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        let names = (0..1_500)
+            .map(|index| format!("수신자 {index:04}"))
+            .collect::<Vec<_>>();
+        let emails = (0..1_500)
+            .map(|index| format!("recipient-{index}@example.com"))
+            .collect::<Vec<_>>();
+        let recipients = names
+            .iter()
+            .zip(&emails)
+            .map(|(name, email)| UnicodePstRecipient {
+                name,
+                email,
+                recipient_type: UnicodePstRecipientType::To,
+            })
+            .collect::<Vec<_>>();
+        let display_to = recipient_display(&recipients, UnicodePstRecipientType::To);
+        assert!(utf16_bytes(&display_to).len() > MAX_HEAP_ALLOCATION_SIZE);
+        let input = UnicodePstMessage {
+            subject: "large recipient display",
+            sender_name: "sender",
+            sender_email: "sender@example.com",
+            recipients: &recipients,
+            body: "body",
+            html_body: None,
+            message_id: "<large-display-to@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+
+        drop(UnicodePstFile::create(&path, &input).unwrap());
+        drop(UnicodePstFile::append_many(&path, &[input, input]).unwrap());
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(&path).unwrap())).unwrap();
+        let inbox = folder_at_path(&store, &["Inbox"]);
+        assert_eq!(inbox.properties().content_count().unwrap(), 3);
+        let contents = inbox.contents_table().unwrap();
+        for row in contents.rows_matrix() {
+            let values = row.columns(contents.context()).unwrap();
+            let (column, value) = contents
+                .context()
+                .columns()
+                .iter()
+                .zip(&values)
+                .find(|(column, _)| column.prop_id() == 0x0E04)
+                .unwrap();
+            assert!(matches!(value, Some(TableRowColumnValue::Node(_))));
+            match contents
+                .read_column(value.as_ref().unwrap(), column.prop_type())
+                .unwrap()
+            {
+                PropertyValue::Unicode(value) => assert_eq!(value.to_string(), display_to),
+                value => panic!("unexpected display-to value: {value:?}"),
+            }
+        }
+        let message = last_inbox_message(&path);
+        assert_eq!(
+            message.recipient_table().unwrap().rows_matrix().count(),
+            recipients.len()
+        );
+        drop((message, inbox, store));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fills_nonfinal_data_tree_blocks() {
+        let mut blocks = Vec::new();
+        let mut next_bid = 1;
+        let mut next_offset = AMAP_FIRST_OFFSET;
+        let root = push_data_tree_chunks(
+            &mut blocks,
+            &mut next_bid,
+            &mut next_offset,
+            [vec![1; 100], vec![2; 50]],
+        )
+        .unwrap();
+
+        assert!(root.is_internal());
+        assert_eq!(blocks[0].size as usize, MAX_DATA_BLOCK_SIZE);
+        assert_eq!(blocks[1].size, 50);
+        let NewBlockData::DataTree(_, _, total_size) = blocks.last().unwrap().data else {
+            panic!("expected XBLOCK root");
+        };
+        assert_eq!(total_size as usize, MAX_DATA_BLOCK_SIZE + 50);
+    }
+
+    #[test]
+    fn fills_nonfinal_heap_pages_with_a_padding_allocation() {
+        let mut heap = HeapBuilder::new();
+        for _ in 0..100 {
+            heap.alloc(vec![0x5A; 100]).unwrap();
+        }
+        let pages = heap
+            .finish(HeapNodeType::Properties, HeapId::default())
+            .unwrap();
+
+        assert!(pages.len() > 1);
+        assert_eq!(pages[0].len(), MAX_DATA_BLOCK_SIZE);
+        let mut cursor = Cursor::new(&pages[0]);
+        let page_map_offset = HeapNodeHeader::read(&mut cursor).unwrap().page_map_offset();
+        cursor
+            .seek(SeekFrom::Start(u64::from(page_map_offset)))
+            .unwrap();
+        let page_map = HeapNodePageMap::read(&mut cursor).unwrap();
+        let last = page_map.allocations().last().unwrap();
+        assert_eq!(
+            usize::from(last.offset() + last.size()),
+            usize::from(page_map_offset)
+        );
+        assert_eq!(cursor.position() as usize, pages[0].len());
     }
 
     #[test]
