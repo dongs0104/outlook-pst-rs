@@ -277,6 +277,10 @@ impl TableContextInfo {
     pub fn rows(&self) -> Option<NodeId> {
         self.rows
     }
+
+    pub fn row_index(&self) -> HeapId {
+        self.row_index
+    }
 }
 
 impl TableContextInfoReadWrite for TableContextInfo {
@@ -841,6 +845,8 @@ pub trait TableContext {
     ) -> io::Result<PropertyValue>;
     #[doc(hidden)]
     fn writer_heap_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>>;
+    #[doc(hidden)]
+    fn writer_heap_user_root(&self) -> io::Result<HeapId>;
 }
 
 struct TableContextInner<Pst, RowIndex, RowIndexTree>
@@ -1109,6 +1115,10 @@ impl TableContext for UnicodeTableContext {
     fn writer_heap_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
         self.inner.heap.writer_pages()
     }
+
+    fn writer_heap_user_root(&self) -> io::Result<HeapId> {
+        Ok(self.inner.heap.header()?.user_root())
+    }
 }
 
 impl TableContextReadWrite<UnicodePstFile> for UnicodeTableContext {
@@ -1168,6 +1178,10 @@ impl TableContext for AnsiTableContext {
 
     fn writer_heap_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
         self.inner.heap.writer_pages()
+    }
+
+    fn writer_heap_user_root(&self) -> io::Result<HeapId> {
+        Ok(self.inner.heap.header()?.user_root())
     }
 }
 
