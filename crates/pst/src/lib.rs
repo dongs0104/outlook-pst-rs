@@ -642,7 +642,7 @@ const FMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FMAP_PAGE_COUNT;
 
 const FPMAP_FIRST_SIZE: u64 = 128 * 64;
 const FPMAP_FIRST_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_FIRST_SIZE;
-const FPMAP_FIRST_OFFSET: u64 = AMAP_FIRST_OFFSET + FPMAP_FIRST_DATA_SIZE + (3 * PAGE_SIZE) as u64;
+const FPMAP_FIRST_OFFSET: u64 = AMAP_FIRST_OFFSET + FPMAP_FIRST_DATA_SIZE + (2 * PAGE_SIZE) as u64;
 const FPMAP_PAGE_COUNT: u64 = size_of::<MapBits>() as u64 * 64;
 const FPMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_PAGE_COUNT;
 
@@ -2150,8 +2150,7 @@ fn map_page_count(amap_index: u64) -> u64 {
     let has_fpmap = has_pmap
         && amap_index >= FPMAP_FIRST_SIZE
         && (amap_index - FPMAP_FIRST_SIZE) % FPMAP_PAGE_COUNT == 0;
-    // FPMaps start three pages after their AMap, so reserve all four pages through the FPMap.
-    1 + u64::from(has_pmap) + u64::from(has_fmap) + 2 * u64::from(has_fpmap)
+    1 + u64::from(has_pmap) + u64::from(has_fmap) + u64::from(has_fpmap)
 }
 
 fn reserve_file_range(next_offset: &mut u64, size: u64, alignment: u64) -> u64 {
@@ -4689,6 +4688,9 @@ mod create_tests {
     #[test]
     fn reserves_allocation_metadata_through_64_gib() {
         const LIMIT: u64 = 64 * 1024 * 1024 * 1024;
+
+        assert_eq!(FPMAP_FIRST_OFFSET, 0x7C004800);
+        assert_eq!(map_page_count(FPMAP_FIRST_SIZE), 3);
 
         for (first, interval) in [
             (AMAP_FIRST_OFFSET, AMAP_DATA_SIZE),
