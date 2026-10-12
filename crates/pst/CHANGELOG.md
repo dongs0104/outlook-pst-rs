@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.11] - 2026-10-13
+
+### Fixed
+
+- split heap page padding into allocations of at most 3580 bytes; a larger padding allocation made SCANPST stop with Fatal Error 80040813 after several large appends
+
+### Changed
+
+- append new contents-table rows incrementally, keeping unchanged heap pages and full row blocks instead of rebuilding the whole table per call
+- patch the parent hierarchy content count in place instead of leaking a row index into its heap per call
+- reuse space the allocation map marks free before growing the file; repeated appends no longer grow the PST with discarded B-trees and table blocks
+
 ## [1.2.10] - 2026-10-12
 
 ### Fixed
