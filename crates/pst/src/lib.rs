@@ -1248,7 +1248,7 @@ fn patch_table_row(
     row_version: u32,
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<Option<UnicodeBlockId>> {
     let context = table.context();
     let row_size = usize::from(context.end_existence_bitmap());
@@ -1730,7 +1730,7 @@ fn append_table_rows(
     row_version: u32,
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<Option<(UnicodeBlockId, UnicodeBlockId, usize)>> {
     let context = table.context();
     let row_size = usize::from(context.end_existence_bitmap());
@@ -2361,7 +2361,7 @@ fn collect_node_btree_entries(
 fn reserve_btree_page(
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     data: NewBTreePageData,
 ) -> io::Result<UnicodePageRef> {
     let id = *next_page;
@@ -2377,7 +2377,7 @@ fn plan_intermediate_btree_pages(
     mut children: Vec<(u64, UnicodePageRef)>,
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<UnicodePageRef> {
     let mut level = 1_u8;
     while children.len() > 1 {
@@ -2413,7 +2413,7 @@ fn plan_block_btree(
     entries: &[UnicodeBlockBTreeEntry],
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<UnicodePageRef> {
     let children = entries
         .chunks(20)
@@ -2441,7 +2441,7 @@ fn plan_node_btree(
     entries: &[UnicodeNodeBTreeEntry],
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<UnicodePageRef> {
     let children = entries
         .chunks(15)
@@ -2496,7 +2496,7 @@ fn write_btree_page(file: &mut File, page: NewBTreePage) -> io::Result<()> {
 fn push_block(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     internal: bool,
     data: NewBlockData,
 ) -> io::Result<UnicodeBlockId> {
@@ -2508,7 +2508,7 @@ fn push_block(
 
 fn push_block_with_id(
     blocks: &mut Vec<NewBlock>,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     id: UnicodeBlockId,
     data: NewBlockData,
 ) -> io::Result<()> {
@@ -2551,7 +2551,71 @@ fn map_page_count(amap_index: u64) -> u64 {
     1 + u64::from(has_pmap) + u64::from(has_fmap) + u64::from(has_fpmap)
 }
 
-fn reserve_file_range(next_offset: &mut u64, size: u64, alignment: u64) -> u64 {
+/// Where new blocks and pages go: space the committed AMap marks free, then EOF.
+/// Free space is unreferenced by the committed B-trees, so overwriting it before
+/// the header switches over keeps the old state intact.
+struct FileSpace {
+    eof: u64,
+    free: Vec<(u64, u64)>,
+}
+
+impl From<u64> for FileSpace {
+    fn from(eof: u64) -> Self {
+        Self {
+            eof,
+            free: Vec::new(),
+        }
+    }
+}
+
+impl FileSpace {
+    fn read(file: &mut File, root: &UnicodeRoot) -> io::Result<Self> {
+        let mut space = Self::from(root.file_eof_index().index());
+        if root.amap_is_valid() == AmapStatus::Invalid {
+            return Ok(space);
+        }
+        let mut page = [0; PAGE_SIZE];
+        let mut amap = AMAP_FIRST_OFFSET;
+        while amap < space.eof {
+            file.seek(SeekFrom::Start(amap))?;
+            file.read_exact(&mut page)?;
+            let bits = size_of::<MapBits>();
+            if page[bits] != PageType::AllocationMap as u8 {
+                return Ok(Self::from(space.eof));
+            }
+            for bit in 0..bits * 8 {
+                let offset = amap + bit as u64 * 64;
+                if offset >= space.eof {
+                    break;
+                }
+                if page[bit / 8] & (0x80 >> (bit % 8)) != 0 {
+                    continue;
+                }
+                match space.free.last_mut() {
+                    Some((_, end)) if *end == offset => *end += 64,
+                    _ => space.free.push((offset, offset + 64)),
+                }
+            }
+            amap += AMAP_DATA_SIZE;
+        }
+        Ok(space)
+    }
+}
+
+fn reserve_file_range(space: &mut FileSpace, size: u64, alignment: u64) -> u64 {
+    // ponytail: first-fit linear scan, keep a size index if fragmented files make this hot
+    for index in 0..space.free.len() {
+        let (start, end) = space.free[index];
+        let offset = start.div_ceil(alignment) * alignment;
+        if offset + size <= end {
+            let rest = [(start, offset), (offset + size, end)];
+            space
+                .free
+                .splice(index..=index, rest.into_iter().filter(|(a, b)| a < b));
+            return offset;
+        }
+    }
+    let next_offset = &mut space.eof;
     let mut offset = next_offset.div_ceil(alignment) * alignment;
     loop {
         if offset < AMAP_FIRST_OFFSET {
@@ -2584,7 +2648,7 @@ fn reserve_file_range(next_offset: &mut u64, size: u64, alignment: u64) -> u64 {
 fn push_data_tree(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     data: &[u8],
 ) -> io::Result<UnicodeBlockId> {
     push_data_tree_chunks(
@@ -2598,7 +2662,7 @@ fn push_data_tree(
 fn push_data_tree_chunks(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     chunks: impl IntoIterator<Item = Vec<u8>>,
 ) -> io::Result<UnicodeBlockId> {
     let mut chunks = chunks.into_iter().collect::<Vec<_>>();
@@ -2639,7 +2703,7 @@ fn push_data_tree_chunks(
 fn push_data_tree_leaves(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     mut ids: Vec<(UnicodeBlockId, u32)>,
 ) -> io::Result<UnicodeBlockId> {
     if ids.is_empty() {
@@ -2681,7 +2745,7 @@ fn push_data_tree_leaves(
 fn push_recipient_table(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     recipients: &[UnicodePstRecipient<'_>],
     row_version: u32,
 ) -> io::Result<(UnicodeBlockId, Option<UnicodeBlockId>)> {
@@ -2704,7 +2768,7 @@ fn push_recipient_table(
 fn push_subnode_tree(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     mut entries: Vec<UnicodeLeafSubNodeTreeEntry>,
 ) -> io::Result<UnicodeBlockId> {
     const LEAF_CAPACITY: usize = (MAX_DATA_BLOCK_SIZE
@@ -2811,7 +2875,7 @@ fn write_new_block(file: &mut File, block: NewBlock) -> io::Result<()> {
 fn push_attachments(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     attachments: &[UnicodePstAttachment<'_>],
     row_version: u32,
     sub_nodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
@@ -3223,7 +3287,7 @@ fn append_search_updates(
     nbt_entries: &mut Vec<UnicodeNodeBTreeEntry>,
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     updates: impl IntoIterator<Item = SearchUpdateData>,
 ) -> io::Result<()> {
     let Some(queue_entry) = nbt_entries
@@ -3352,7 +3416,7 @@ fn commit_unicode_changes(
     mut nbt_entries: Vec<UnicodeNodeBTreeEntry>,
     blocks: Vec<NewBlock>,
     next_bid: u64,
-    mut next_offset: u64,
+    mut next_offset: FileSpace,
     reserved_nodes: &[NodeId],
 ) -> io::Result<()> {
     bbt_entries.extend(blocks.iter().map(|block| {
@@ -3378,7 +3442,7 @@ fn commit_unicode_changes(
     let mut next_page = header.next_page();
     let bbt_ref = plan_block_btree(&bbt_entries, &mut pages, &mut next_page, &mut next_offset)?;
     let nbt_ref = plan_node_btree(&nbt_entries, &mut pages, &mut next_page, &mut next_offset)?;
-    let new_eof = next_offset;
+    let new_eof = next_offset.eof;
     let amap_last =
         AMAP_FIRST_OFFSET + ((new_eof - AMAP_FIRST_OFFSET - 1) / AMAP_DATA_SIZE) * AMAP_DATA_SIZE;
 
@@ -3496,7 +3560,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = old_root.file_eof_index().index();
+    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
     let mut blocks = Vec::new();
 
     let (hierarchy_data_bid, hierarchy_subnode_bid) =
@@ -3860,7 +3924,7 @@ fn append_unicode_pst(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = old_root.file_eof_index().index();
+    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
     header.root_mut().set_amap_status(AmapStatus::Invalid);
     header.update_unique();
     file.seek(SeekFrom::Start(0))?;
@@ -4427,6 +4491,14 @@ mod create_tests {
         // Page-boundary padding costs at most about one BTH leaf per call; leaking the row index
         // per call would add ~2 pages per call here.
         assert!(call_pages <= bulk_pages + 4, "{call_pages} vs {bulk_pages}");
+        // Space freed by earlier calls (old B-trees, rewritten table blocks) is reused.
+        let size = |path: &Path| std::fs::metadata(path).unwrap().len();
+        assert!(
+            size(&calls) < size(&bulk) * 5 / 4,
+            "{} vs {}",
+            size(&calls),
+            size(&bulk)
+        );
         std::fs::remove_file(bulk).unwrap();
         std::fs::remove_file(calls).unwrap();
     }
@@ -4435,7 +4507,7 @@ mod create_tests {
     fn fills_nonfinal_data_tree_blocks() {
         let mut blocks = Vec::new();
         let mut next_bid = 1;
-        let mut next_offset = AMAP_FIRST_OFFSET;
+        let mut next_offset = FileSpace::from(AMAP_FIRST_OFFSET);
         let root = push_data_tree_chunks(
             &mut blocks,
             &mut next_bid,
@@ -4457,7 +4529,7 @@ mod create_tests {
     fn writes_local_totals_for_multilevel_data_trees() {
         let mut blocks = Vec::new();
         let mut next_bid = 1;
-        let mut next_offset = AMAP_FIRST_OFFSET;
+        let mut next_offset = FileSpace::from(AMAP_FIRST_OFFSET);
         let root = push_data_tree_chunks(
             &mut blocks,
             &mut next_bid,
@@ -5281,7 +5353,7 @@ mod create_tests {
         ] {
             let mut metadata_offset = first;
             while metadata_offset < LIMIT {
-                let mut next_offset = metadata_offset;
+                let mut next_offset = FileSpace::from(metadata_offset);
                 let allocation =
                     reserve_file_range(&mut next_offset, PAGE_SIZE as u64, PAGE_SIZE as u64);
                 assert!(
