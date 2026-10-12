@@ -1,6 +1,7 @@
 //! ## [HN (Heap-on-Node)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/77ce49a3-3772-4d8d-bb2c-2f7520a238a6)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::cell::OnceCell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 use super::{read_write::*, *};
@@ -515,6 +516,9 @@ where
     Pst: PstFile,
 {
     data: Vec<<Pst as PstFile>::DataBlock>,
+    /// Parsed `(start, end)` allocation ranges per block, filled on first lookup. Table rebuilds call
+    /// `find_entry` once per heap-backed cell, so re-parsing the page map on every call dominated them.
+    page_maps: Vec<OnceCell<Vec<(usize, usize)>>>,
 }
 
 impl<Pst> HeapNodeInner<Pst>
@@ -558,9 +562,10 @@ where
                 page_cache,
                 &mut Default::default(),
             )?
-            .collect();
+            .collect::<Vec<_>>();
+        let page_maps = data.iter().map(|_| OnceCell::new()).collect();
 
-        Ok(Self { data })
+        Ok(Self { data, page_maps })
     }
 
     fn header(&self) -> io::Result<HeapNodeHeader> {
@@ -581,36 +586,40 @@ where
             .ok_or(LtpError::HeapBlockIndexNotFound(block_index))?
             .data();
 
-        let mut cursor = Cursor::new(block);
-
-        let page_map_offset = match block_index {
-            0 => {
-                let header = HeapNodeHeader::read(&mut cursor)?;
-                header.page_map_offset()
-            }
-            bitmap if bitmap % 128 == 8 => {
-                let header = HeapNodeBitmapHeader::read(&mut cursor)?;
-                header.page_map_offset()
-            }
-            _ => {
-                let header = HeapNodePageHeader::read(&mut cursor)?;
-                header.page_map_offset()
+        let allocations = match self.page_maps[block_index as usize].get() {
+            Some(allocations) => allocations,
+            None => {
+                let parsed = Self::page_map_ranges(block, block_index)?;
+                self.page_maps[block_index as usize].get_or_init(|| parsed)
             }
         };
 
+        let index = heap_id.index()?;
+        let &(start, end) = allocations
+            .get(index as usize)
+            .ok_or(LtpError::HeapAllocIndexNotFound(index))?;
+        Ok(&block[start..end])
+    }
+
+    fn page_map_ranges(block: &[u8], block_index: u16) -> io::Result<Vec<(usize, usize)>> {
+        let mut cursor = Cursor::new(block);
+        let page_map_offset = match block_index {
+            0 => HeapNodeHeader::read(&mut cursor)?.page_map_offset(),
+            bitmap if bitmap % 128 == 8 => {
+                HeapNodeBitmapHeader::read(&mut cursor)?.page_map_offset()
+            }
+            _ => HeapNodePageHeader::read(&mut cursor)?.page_map_offset(),
+        };
         cursor.seek(SeekFrom::Start(u64::from(page_map_offset)))?;
         let page_map = HeapNodePageMap::read(&mut cursor)?;
-        let allocations = page_map.allocations();
-
-        let index = heap_id.index()?;
-        if index as usize >= allocations.len() {
-            return Err(LtpError::HeapAllocIndexNotFound(index).into());
-        }
-
-        let alloc = &allocations[index as usize];
-        let start = alloc.offset() as usize;
-        let end = start + alloc.size() as usize;
-        Ok(&block[start..end])
+        Ok(page_map
+            .allocations()
+            .iter()
+            .map(|alloc| {
+                let start = alloc.offset() as usize;
+                (start, start + alloc.size() as usize)
+            })
+            .collect())
     }
 
     fn writer_pages(&self) -> io::Result<Vec<Vec<Vec<u8>>>> {
