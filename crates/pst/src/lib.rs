@@ -650,6 +650,8 @@ const MAX_DATA_BLOCK_SIZE: usize =
     (ndb::block::MAX_BLOCK_SIZE - UnicodeBlockTrailer::SIZE) as usize;
 // Largest value that fits on an empty continuation HN page with its aligned page map.
 const MAX_HEAP_ALLOCATION_SIZE: usize = MAX_DATA_BLOCK_SIZE - 15;
+// MS-PST limit for one HN allocation. SCANPST stops on padding above it (Fatal Error 80040813).
+const MAX_HN_ALLOCATION_SIZE: usize = 3580;
 
 const OUTLOOK_UNICODE_PST_TEMPLATE: &[u8] = include_bytes!("../examples/Empty.pst");
 
@@ -707,17 +709,53 @@ fn finish_heap(
 
 struct HeapBuilder {
     pages: Vec<Vec<Vec<u8>>>,
+    /// Pages whose encoding changed since `from_pages`; `finish_dirty` re-encodes only these.
+    dirty: Vec<bool>,
 }
 
 impl HeapBuilder {
     fn new() -> Self {
         Self {
             pages: vec![vec![Vec::new()]],
+            dirty: vec![true],
         }
     }
 
     fn from_pages(pages: Vec<Vec<Vec<u8>>>) -> Self {
-        Self { pages }
+        let dirty = vec![false; pages.len()];
+        Self { pages, dirty }
+    }
+
+    fn slot(&self, heap_id: HeapId) -> io::Result<(usize, usize)> {
+        let page = usize::from(heap_id.block_index());
+        let index = usize::from(heap_id.index()?) + 1;
+        if self.pages.get(page).is_none_or(|page| index >= page.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "heap allocation is missing",
+            ));
+        }
+        Ok((page, index))
+    }
+
+    fn get(&self, heap_id: HeapId) -> io::Result<&[u8]> {
+        let (page, index) = self.slot(heap_id)?;
+        Ok(&self.pages[page][index])
+    }
+
+    /// Overwrite an allocation in place, keeping its HID. Callers keep the size unchanged.
+    fn replace(&mut self, heap_id: HeapId, data: Vec<u8>) -> io::Result<()> {
+        let (page, index) = self.slot(heap_id)?;
+        self.pages[page][index] = data;
+        self.dirty[page] = true;
+        Ok(())
+    }
+
+    /// Free an allocation: it is encoded as a zero-length page map entry so other HIDs stay valid.
+    fn free(&mut self, heap_id: HeapId) -> io::Result<Vec<u8>> {
+        let (page, index) = self.slot(heap_id)?;
+        self.dirty[page] = true;
+        Ok(std::mem::take(&mut self.pages[page][index]))
     }
 
     fn header_size(page: usize) -> usize {
@@ -747,7 +785,10 @@ impl HeapBuilder {
                 < MAX_DATA_BLOCK_SIZE
         };
         if !fits(page, &self.pages[page]) {
+            // The old last page becomes non-final and must be re-encoded with its padding.
+            self.dirty[page] = true;
             self.pages.push(vec![Vec::new()]);
+            self.dirty.push(true);
             page += 1;
             if !fits(page, &self.pages[page]) {
                 return Err(io::Error::new(
@@ -763,30 +804,58 @@ impl HeapBuilder {
             u16::try_from(page).map_err(|_| PstError::IntegerConversion)?,
         )?;
         self.pages[page].push(data);
+        self.dirty[page] = true;
         Ok(heap_id)
     }
 
-    fn finish(self, client_signature: HeapNodeType, user_root: HeapId) -> io::Result<Vec<Vec<u8>>> {
+    fn finish(
+        mut self,
+        client_signature: HeapNodeType,
+        user_root: HeapId,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        self.dirty.fill(true);
+        self.finish_dirty(client_signature, user_root)?
+            .into_iter()
+            .map(|page| page.ok_or_else(|| io::Error::other("heap page was not encoded")))
+            .collect()
+    }
+
+    /// Encode the dirty pages; `None` marks a page whose existing block can be reused as is.
+    fn finish_dirty(
+        mut self,
+        client_signature: HeapNodeType,
+        user_root: HeapId,
+    ) -> io::Result<Vec<Option<Vec<u8>>>> {
         let page_count = self.pages.len();
+        let dirty = std::mem::take(&mut self.dirty);
         self.pages
             .into_iter()
+            .zip(dirty)
             .enumerate()
-            .map(|(page, mut allocations)| {
+            .map(|(page, (mut allocations, dirty))| {
+                if !dirty {
+                    return Ok(None);
+                }
                 let header_size = Self::header_size(page);
                 if page + 1 < page_count {
                     let allocations_end =
                         header_size + allocations.iter().skip(1).map(Vec::len).sum::<usize>();
                     let encoded_size = allocations_end + 4 + 2 * allocations.len();
                     if encoded_size < MAX_DATA_BLOCK_SIZE {
-                        let padding = MAX_DATA_BLOCK_SIZE
-                            .checked_sub(encoded_size + 2)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "heap page has no room for a padding allocation",
-                                )
-                            })?;
-                        allocations.push(vec![0; padding]);
+                        // Outlook rejects a heap whose padding is one allocation over the HN limit,
+                        // so split it; each extra allocation costs a 2-byte page map entry.
+                        let free = MAX_DATA_BLOCK_SIZE - encoded_size;
+                        let count = free.div_ceil(MAX_HN_ALLOCATION_SIZE + 2);
+                        let bytes = free.checked_sub(2 * count).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "heap page has no room for a padding allocation",
+                            )
+                        })?;
+                        for index in 0..count {
+                            let size = bytes / count + usize::from(index < bytes % count);
+                            allocations.push(vec![0; size]);
+                        }
                     } else if encoded_size > MAX_DATA_BLOCK_SIZE {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -844,7 +913,7 @@ impl HeapBuilder {
                         "encoded heap page exceeds one Unicode PST data block",
                     ));
                 }
-                Ok(data)
+                Ok(Some(data))
             })
             .collect()
     }
@@ -950,7 +1019,6 @@ enum TableCell {
 }
 
 type RebuiltTable = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<NodeId>);
-type RebuiltContentsTable = (RebuiltTable, Vec<(NodeId, Vec<u8>)>);
 
 fn table_pointer_type(prop_type: PropertyType) -> bool {
     matches!(
@@ -1060,29 +1128,41 @@ where
     T: Copy,
     u32: From<T>,
 {
-    let mut children = rows
-        .chunks(750)
+    let children = rows
+        .chunks(ROW_INDEX_FANOUT)
         .enumerate()
         .map(|(chunk_index, chunk)| {
             let mut data = Vec::with_capacity(chunk.len() * 8);
             for (index, row) in chunk.iter().enumerate() {
                 TableRowId::new(u32::from(*row)).write(&mut data)?;
                 data.write_u32::<byteorder::LittleEndian>(
-                    u32::try_from(chunk_index * 750 + index)
+                    u32::try_from(chunk_index * ROW_INDEX_FANOUT + index)
                         .map_err(|_| PstError::IntegerConversion)?,
                 )?;
             }
-            Ok((TableRowId::new(u32::from(chunk[0])), heap.alloc(data)?))
+            Ok((u32::from(chunk[0]), heap.alloc(data)?))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let mut levels = 0;
+    let header = row_index_header(heap, children, 0)?;
+    heap.alloc(header)
+}
+
+const ROW_INDEX_FANOUT: usize = 750;
+
+/// Stack intermediate levels over `children` (`(first row id, node)`) and encode the BTH header.
+fn row_index_header(
+    heap: &mut HeapBuilder,
+    mut children: Vec<(u32, HeapId)>,
+    mut levels: u8,
+) -> io::Result<Vec<u8>> {
     while children.len() > 1 {
         children = children
-            .chunks(750)
+            .chunks(ROW_INDEX_FANOUT)
             .map(|chunk| {
                 let mut data = Vec::with_capacity(chunk.len() * 8);
                 for (key, child) in chunk {
-                    HeapTreeIntermediateEntry::new(*key, *child).write(&mut data)?;
+                    HeapTreeIntermediateEntry::new(TableRowId::new(*key), *child)
+                        .write(&mut data)?;
                 }
                 Ok((chunk[0].0, heap.alloc(data)?))
             })
@@ -1092,7 +1172,152 @@ where
     let root = children.first().map(|entry| entry.1).unwrap_or_default();
     let mut header = Vec::new();
     HeapTreeHeader::new(4, 4, levels, root)?.write(&mut header)?;
-    heap.alloc(header)
+    Ok(header)
+}
+
+/// Free the right spine of a row-index BTH, root first, returning each node without its last
+/// (rewritten) child entry. Freeing before new rows are encoded lets them reuse the space.
+fn take_row_index_spine(
+    heap: &mut HeapBuilder,
+    index: &HeapTreeHeader,
+) -> io::Result<Vec<Vec<u8>>> {
+    let mut node = index.root();
+    let mut spine = Vec::new();
+    for level in (0..=index.levels()).rev() {
+        let mut data = heap.free(node)?;
+        if data.is_empty() || data.len() % 8 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table row index node is malformed",
+            ));
+        }
+        if level > 0 {
+            let last = data.len() - 8;
+            node = HeapId::from(u32::from_le_bytes(data[last + 4..].try_into().unwrap()));
+            data.truncate(last);
+        }
+        spine.push(data);
+    }
+    Ok(spine)
+}
+
+/// Re-allocate a spine from `take_row_index_spine` with `(row id, row index)` records appended
+/// and return the new BTH header.
+fn append_row_index_spine(
+    heap: &mut HeapBuilder,
+    mut spine: Vec<Vec<u8>>,
+    levels: u8,
+    records: &[(u32, u32)],
+) -> io::Result<Vec<u8>> {
+    let mut children: Vec<(u32, HeapId)> = Vec::new();
+    let mut leaf = true;
+    while let Some(mut data) = spine.pop() {
+        if leaf {
+            for (key, value) in records {
+                data.extend_from_slice(&key.to_le_bytes());
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            leaf = false;
+        }
+        for (key, child) in children {
+            data.extend_from_slice(&key.to_le_bytes());
+            data.extend_from_slice(&u32::from(child).to_le_bytes());
+        }
+        children = data
+            .chunks(ROW_INDEX_FANOUT * 8)
+            .map(|chunk| {
+                let key = u32::from_le_bytes(chunk[..4].try_into().unwrap());
+                Ok((key, heap.alloc(chunk.to_vec())?))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+    }
+    row_index_header(heap, children, levels)
+}
+
+/// Overwrite fixed-width cells of one row in a subnode row matrix, bumping its row version. Only
+/// the row's data block and the XBLOCKs are rewritten and the heap is reused as is. Returns `None`
+/// when the row matrix lives in the heap or a cell does not fit, so callers fall back to a rebuild.
+#[allow(clippy::too_many_arguments)]
+fn patch_table_row(
+    file: &mut File,
+    bbt_entries: &[UnicodeBlockBTreeEntry],
+    table: &dyn TableContext,
+    rows_block: Option<UnicodeBlockId>,
+    row: NodeId,
+    cells: &[(u16, PropertyValue)],
+    row_version: u32,
+    blocks: &mut Vec<NewBlock>,
+    next_bid: &mut u64,
+    next_offset: &mut FileSpace,
+) -> io::Result<Option<UnicodeBlockId>> {
+    let context = table.context();
+    let row_size = usize::from(context.end_existence_bitmap());
+    let position = table
+        .rows_matrix()
+        .position(|candidate| u32::from(candidate.id()) == u32::from(row));
+    let (Some(rows_block), Some(position)) = (rows_block, position) else {
+        return Ok(None);
+    };
+    if !(8..=MAX_DATA_BLOCK_SIZE).contains(&row_size)
+        || context
+            .rows()
+            .is_none_or(|rows| matches!(rows.id_type(), Ok(NodeIdType::HeapNode)))
+    {
+        return Ok(None);
+    }
+
+    let version = PropertyValue::Integer32(row_version as i32);
+    let mut patches = vec![(4, row_version.to_le_bytes().to_vec(), None)];
+    for (prop_id, value) in cells.iter().chain([&(LTP_ROW_VERSION_PROP_ID, version)]) {
+        let column = context.columns().iter().find(|column| {
+            column.prop_id() == *prop_id && column.prop_type() == PropertyType::from(value)
+        });
+        let Some(column) = column.filter(|column| !table_pointer_type(column.prop_type())) else {
+            if *prop_id == LTP_ROW_VERSION_PROP_ID {
+                continue;
+            }
+            return Ok(None);
+        };
+        let mut bytes = vec![0; usize::from(column.size())];
+        write_fixed_table_value(&mut bytes, column.prop_type(), value)?;
+        patches.push((
+            usize::from(column.offset()),
+            bytes,
+            Some(usize::from(column.existence_bitmap_index())),
+        ));
+    }
+
+    let mut leaves = data_tree_leaves(file, bbt_entries, rows_block)?;
+    let rows_per_block = MAX_DATA_BLOCK_SIZE / row_size;
+    let Some(&(leaf, _)) = leaves.get(position / rows_per_block) else {
+        return Ok(None);
+    };
+    let mut data = read_data_block(file, bbt_entries, leaf)?;
+    let start = position % rows_per_block * row_size;
+    let Some(row_data) = data.get_mut(start..start + row_size) else {
+        return Ok(None);
+    };
+    for (offset, bytes, bit) in patches {
+        row_data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        if let Some(bit) = bit {
+            row_data[usize::from(context.end_1byte_values()) + bit / 8] |= 0x80 >> (bit % 8);
+        }
+    }
+    let size = u32::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?;
+    let block = push_block(
+        blocks,
+        next_bid,
+        next_offset,
+        false,
+        NewBlockData::Data(data),
+    )?;
+    leaves[position / rows_per_block] = (block, size);
+    Ok(Some(push_data_tree_leaves(
+        blocks,
+        next_bid,
+        next_offset,
+        leaves,
+    )?))
 }
 
 fn string_table_cell(prop_type: PropertyType, value: &str) -> Option<TableCell> {
@@ -1383,18 +1608,20 @@ fn rebuild_table(
     Ok((heap_pages, row_chunks, row_ids))
 }
 
+type NewTableRows = Vec<(NodeId, Vec<Option<TableCell>>)>;
+type ExternalValues = Vec<(NodeId, Vec<u8>)>;
+
 #[allow(clippy::too_many_arguments)]
-fn rebuild_contents_table(
+fn new_contents_rows(
     table: &dyn TableContext,
     inputs: &[UnicodePstBatchMessage<'_>],
     store_record_key: [u8; 16],
     folder: NodeId,
     messages: &[NodeId],
     message_sizes: &[i32],
-    rows_node: NodeId,
     mut next_subnode_index: u32,
     row_version: u32,
-) -> io::Result<RebuiltContentsTable> {
+) -> io::Result<(NewTableRows, ExternalValues)> {
     let mut external = Vec::new();
     let rows = inputs
         .iter()
@@ -1434,10 +1661,181 @@ fn rebuild_contents_table(
             Ok((*message, cells))
         })
         .collect::<io::Result<Vec<_>>>()?;
-    Ok((
-        rebuild_table_with_rows_and_version(table, rows, Some(rows_node), row_version)?,
-        external,
-    ))
+    Ok((rows, external))
+}
+
+fn bbt_entry(
+    bbt_entries: &[UnicodeBlockBTreeEntry],
+    block: UnicodeBlockId,
+) -> io::Result<UnicodeBlockBTreeEntry> {
+    bbt_entries
+        .binary_search_by_key(&block.search_key(), BTreeEntry::key)
+        .map(|index| bbt_entries[index])
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("referenced PST block {:X} is missing", block.search_key()),
+            )
+        })
+}
+
+/// The leaf data blocks of a data tree, in order, as `(block, size)`.
+fn data_tree_leaves(
+    file: &mut File,
+    bbt_entries: &[UnicodeBlockBTreeEntry],
+    block: UnicodeBlockId,
+) -> io::Result<Vec<(UnicodeBlockId, u32)>> {
+    let entry = bbt_entry(bbt_entries, block)?;
+    match UnicodeDataTree::read(file, NdbCryptMethod::None, &entry)? {
+        DataTree::Leaf(_) => Ok(vec![(block, u32::from(entry.size()))]),
+        DataTree::Intermediate(tree) => {
+            let mut leaves = Vec::new();
+            for child in tree.entries() {
+                leaves.extend(data_tree_leaves(file, bbt_entries, child.block())?);
+            }
+            Ok(leaves)
+        }
+    }
+}
+
+fn read_data_block(
+    file: &mut File,
+    bbt_entries: &[UnicodeBlockBTreeEntry],
+    block: UnicodeBlockId,
+) -> io::Result<Vec<u8>> {
+    let entry = bbt_entry(bbt_entries, block)?;
+    match UnicodeDataTree::read(file, NdbCryptMethod::None, &entry)? {
+        DataTree::Leaf(block) => Ok(block.data().to_vec()),
+        DataTree::Intermediate(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a leaf data block",
+        )),
+    }
+}
+
+/// Append rows to a table in place: unchanged heap pages and full row-matrix blocks keep their
+/// block IDs, only the last row block, the dirty heap pages and the XBLOCKs are written, so a call
+/// writes O(new rows) bytes. Returns `None`, leaving `new_rows` untouched, when the table layout
+/// (rows in the heap, empty table, out-of-order row IDs) needs the full rebuild instead.
+/// ponytail: still reads the whole table through `TableContext`; read only the right spine if
+/// those reads show up in profiles.
+#[allow(clippy::too_many_arguments)]
+fn append_table_rows(
+    file: &mut File,
+    bbt_entries: &[UnicodeBlockBTreeEntry],
+    table: &dyn TableContext,
+    heap_block: UnicodeBlockId,
+    rows_block: Option<UnicodeBlockId>,
+    new_rows: &mut NewTableRows,
+    row_version: u32,
+    blocks: &mut Vec<NewBlock>,
+    next_bid: &mut u64,
+    next_offset: &mut FileSpace,
+) -> io::Result<Option<(UnicodeBlockId, UnicodeBlockId, usize)>> {
+    let context = table.context();
+    let row_size = usize::from(context.end_existence_bitmap());
+    let old_count = table.rows_matrix().count();
+    let mut last_id = table.rows_matrix().map(|row| u32::from(row.id())).max();
+    let in_order = new_rows.iter().all(|(id, _)| {
+        let id = u32::from(*id);
+        let ordered = last_id.is_none_or(|last| id > last);
+        last_id = Some(id);
+        ordered
+    });
+    let Some(rows_block) = rows_block else {
+        return Ok(None);
+    };
+    if old_count == 0
+        || !in_order
+        || row_size == 0
+        || row_size > MAX_DATA_BLOCK_SIZE
+        || context
+            .rows()
+            .is_none_or(|rows| matches!(rows.id_type(), Ok(NodeIdType::HeapNode)))
+    {
+        return Ok(None);
+    }
+
+    let mut heap = HeapBuilder::from_pages(table.writer_heap_pages()?);
+    let index_hid = context.row_index();
+    let index = HeapTreeHeader::read(&mut heap.get(index_hid)?)?;
+    if index.key_size() != 4 || index.entry_size() != 4 || u32::from(index.root()) == 0 {
+        return Ok(None);
+    }
+    let heap_leaves = data_tree_leaves(file, bbt_entries, heap_block)?;
+    let mut row_leaves = data_tree_leaves(file, bbt_entries, rows_block)?;
+    let rows_per_block = MAX_DATA_BLOCK_SIZE / row_size;
+    let tail_rows = old_count.checked_sub((row_leaves.len() - 1) * rows_per_block);
+    let Some(tail_rows) = tail_rows.filter(|rows| (1..=rows_per_block).contains(rows)) else {
+        return Ok(None);
+    };
+    let (tail_block, _) = row_leaves.pop().unwrap();
+    let mut tail = read_data_block(file, bbt_entries, tail_block)?;
+    if heap_leaves.len() != heap.pages.len() || tail.len() < tail_rows * row_size {
+        return Ok(None);
+    }
+    tail.truncate(tail_rows * row_size);
+
+    let spine = take_row_index_spine(&mut heap, &index)?;
+    let mut records = Vec::with_capacity(new_rows.len());
+    for (row_id, cells) in std::mem::take(new_rows) {
+        let row_index =
+            u32::try_from(old_count + records.len()).map_err(|_| PstError::IntegerConversion)?;
+        tail.extend(encode_table_row(
+            context,
+            &mut heap,
+            row_id,
+            row_version,
+            cells,
+        )?);
+        records.push((u32::from(row_id), row_index));
+    }
+    let row_count = old_count + records.len();
+    let header = append_row_index_spine(&mut heap, spine, index.levels(), &records)?;
+    heap.replace(index_hid, header)?;
+
+    let heap_pages = heap.finish_dirty(HeapNodeType::Table, table.writer_heap_user_root()?)?;
+    let heap_leaves = heap_pages
+        .into_iter()
+        .enumerate()
+        .map(|(page, data)| match data {
+            None => Ok(heap_leaves[page]),
+            Some(data) => {
+                let size = u32::try_from(data.len()).map_err(|_| PstError::IntegerConversion)?;
+                let block = push_block(
+                    blocks,
+                    next_bid,
+                    next_offset,
+                    false,
+                    NewBlockData::Data(data),
+                )?;
+                Ok((block, size))
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let heap_root = push_data_tree_leaves(blocks, next_bid, next_offset, heap_leaves)?;
+
+    let mut chunks = tail
+        .chunks(rows_per_block * row_size)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let last = chunks.len() - 1;
+    for chunk in &mut chunks[..last] {
+        chunk.resize(MAX_DATA_BLOCK_SIZE, 0);
+    }
+    for chunk in chunks {
+        let size = u32::try_from(chunk.len()).map_err(|_| PstError::IntegerConversion)?;
+        let block = push_block(
+            blocks,
+            next_bid,
+            next_offset,
+            false,
+            NewBlockData::Data(chunk),
+        )?;
+        row_leaves.push((block, size));
+    }
+    let rows_root = push_data_tree_leaves(blocks, next_bid, next_offset, row_leaves)?;
+    Ok(Some((heap_root, rows_root, row_count)))
 }
 
 fn property_context_data(
@@ -1963,7 +2361,7 @@ fn collect_node_btree_entries(
 fn reserve_btree_page(
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     data: NewBTreePageData,
 ) -> io::Result<UnicodePageRef> {
     let id = *next_page;
@@ -1979,7 +2377,7 @@ fn plan_intermediate_btree_pages(
     mut children: Vec<(u64, UnicodePageRef)>,
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<UnicodePageRef> {
     let mut level = 1_u8;
     while children.len() > 1 {
@@ -2015,7 +2413,7 @@ fn plan_block_btree(
     entries: &[UnicodeBlockBTreeEntry],
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<UnicodePageRef> {
     let children = entries
         .chunks(20)
@@ -2043,7 +2441,7 @@ fn plan_node_btree(
     entries: &[UnicodeNodeBTreeEntry],
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
 ) -> io::Result<UnicodePageRef> {
     let children = entries
         .chunks(15)
@@ -2098,7 +2496,7 @@ fn write_btree_page(file: &mut File, page: NewBTreePage) -> io::Result<()> {
 fn push_block(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     internal: bool,
     data: NewBlockData,
 ) -> io::Result<UnicodeBlockId> {
@@ -2110,7 +2508,7 @@ fn push_block(
 
 fn push_block_with_id(
     blocks: &mut Vec<NewBlock>,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     id: UnicodeBlockId,
     data: NewBlockData,
 ) -> io::Result<()> {
@@ -2153,7 +2551,71 @@ fn map_page_count(amap_index: u64) -> u64 {
     1 + u64::from(has_pmap) + u64::from(has_fmap) + u64::from(has_fpmap)
 }
 
-fn reserve_file_range(next_offset: &mut u64, size: u64, alignment: u64) -> u64 {
+/// Where new blocks and pages go: space the committed AMap marks free, then EOF.
+/// Free space is unreferenced by the committed B-trees, so overwriting it before
+/// the header switches over keeps the old state intact.
+struct FileSpace {
+    eof: u64,
+    free: Vec<(u64, u64)>,
+}
+
+impl From<u64> for FileSpace {
+    fn from(eof: u64) -> Self {
+        Self {
+            eof,
+            free: Vec::new(),
+        }
+    }
+}
+
+impl FileSpace {
+    fn read(file: &mut File, root: &UnicodeRoot) -> io::Result<Self> {
+        let mut space = Self::from(root.file_eof_index().index());
+        if root.amap_is_valid() == AmapStatus::Invalid {
+            return Ok(space);
+        }
+        let mut page = [0; PAGE_SIZE];
+        let mut amap = AMAP_FIRST_OFFSET;
+        while amap < space.eof {
+            file.seek(SeekFrom::Start(amap))?;
+            file.read_exact(&mut page)?;
+            let bits = size_of::<MapBits>();
+            if page[bits] != PageType::AllocationMap as u8 {
+                return Ok(Self::from(space.eof));
+            }
+            for bit in 0..bits * 8 {
+                let offset = amap + bit as u64 * 64;
+                if offset >= space.eof {
+                    break;
+                }
+                if page[bit / 8] & (0x80 >> (bit % 8)) != 0 {
+                    continue;
+                }
+                match space.free.last_mut() {
+                    Some((_, end)) if *end == offset => *end += 64,
+                    _ => space.free.push((offset, offset + 64)),
+                }
+            }
+            amap += AMAP_DATA_SIZE;
+        }
+        Ok(space)
+    }
+}
+
+fn reserve_file_range(space: &mut FileSpace, size: u64, alignment: u64) -> u64 {
+    // ponytail: first-fit linear scan, keep a size index if fragmented files make this hot
+    for index in 0..space.free.len() {
+        let (start, end) = space.free[index];
+        let offset = start.div_ceil(alignment) * alignment;
+        if offset + size <= end {
+            let rest = [(start, offset), (offset + size, end)];
+            space
+                .free
+                .splice(index..=index, rest.into_iter().filter(|(a, b)| a < b));
+            return offset;
+        }
+    }
+    let next_offset = &mut space.eof;
     let mut offset = next_offset.div_ceil(alignment) * alignment;
     loop {
         if offset < AMAP_FIRST_OFFSET {
@@ -2186,7 +2648,7 @@ fn reserve_file_range(next_offset: &mut u64, size: u64, alignment: u64) -> u64 {
 fn push_data_tree(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     data: &[u8],
 ) -> io::Result<UnicodeBlockId> {
     push_data_tree_chunks(
@@ -2200,7 +2662,7 @@ fn push_data_tree(
 fn push_data_tree_chunks(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     chunks: impl IntoIterator<Item = Vec<u8>>,
 ) -> io::Result<UnicodeBlockId> {
     let mut chunks = chunks.into_iter().collect::<Vec<_>>();
@@ -2220,7 +2682,7 @@ fn push_data_tree_chunks(
     for chunk in chunks.iter_mut().take(intermediate_count) {
         chunk.resize(MAX_DATA_BLOCK_SIZE, 0);
     }
-    let mut ids = chunks
+    let ids = chunks
         .into_iter()
         .map(|chunk| {
             let size = u32::try_from(chunk.len()).map_err(|_| PstError::IntegerConversion)?;
@@ -2234,6 +2696,22 @@ fn push_data_tree_chunks(
             Ok((id, size))
         })
         .collect::<io::Result<Vec<_>>>()?;
+    push_data_tree_leaves(blocks, next_bid, next_offset, ids)
+}
+
+/// Build the XBLOCK levels over existing or new leaf data blocks, given as `(block, size)`.
+fn push_data_tree_leaves(
+    blocks: &mut Vec<NewBlock>,
+    next_bid: &mut u64,
+    next_offset: &mut FileSpace,
+    mut ids: Vec<(UnicodeBlockId, u32)>,
+) -> io::Result<UnicodeBlockId> {
+    if ids.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data tree cannot be empty",
+        ));
+    }
     let mut level = 1;
     while ids.len() > 1 {
         ids = ids
@@ -2267,7 +2745,7 @@ fn push_data_tree_chunks(
 fn push_recipient_table(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     recipients: &[UnicodePstRecipient<'_>],
     row_version: u32,
 ) -> io::Result<(UnicodeBlockId, Option<UnicodeBlockId>)> {
@@ -2290,7 +2768,7 @@ fn push_recipient_table(
 fn push_subnode_tree(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     mut entries: Vec<UnicodeLeafSubNodeTreeEntry>,
 ) -> io::Result<UnicodeBlockId> {
     const LEAF_CAPACITY: usize = (MAX_DATA_BLOCK_SIZE
@@ -2397,7 +2875,7 @@ fn write_new_block(file: &mut File, block: NewBlock) -> io::Result<()> {
 fn push_attachments(
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     attachments: &[UnicodePstAttachment<'_>],
     row_version: u32,
     sub_nodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
@@ -2809,7 +3287,7 @@ fn append_search_updates(
     nbt_entries: &mut Vec<UnicodeNodeBTreeEntry>,
     blocks: &mut Vec<NewBlock>,
     next_bid: &mut u64,
-    next_offset: &mut u64,
+    next_offset: &mut FileSpace,
     updates: impl IntoIterator<Item = SearchUpdateData>,
 ) -> io::Result<()> {
     let Some(queue_entry) = nbt_entries
@@ -2938,7 +3416,7 @@ fn commit_unicode_changes(
     mut nbt_entries: Vec<UnicodeNodeBTreeEntry>,
     blocks: Vec<NewBlock>,
     next_bid: u64,
-    mut next_offset: u64,
+    mut next_offset: FileSpace,
     reserved_nodes: &[NodeId],
 ) -> io::Result<()> {
     bbt_entries.extend(blocks.iter().map(|block| {
@@ -2964,7 +3442,7 @@ fn commit_unicode_changes(
     let mut next_page = header.next_page();
     let bbt_ref = plan_block_btree(&bbt_entries, &mut pages, &mut next_page, &mut next_offset)?;
     let nbt_ref = plan_node_btree(&nbt_entries, &mut pages, &mut next_page, &mut next_offset)?;
-    let new_eof = next_offset;
+    let new_eof = next_offset.eof;
     let amap_last =
         AMAP_FIRST_OFFSET + ((new_eof - AMAP_FIRST_OFFSET - 1) / AMAP_DATA_SIZE) * AMAP_DATA_SIZE;
 
@@ -3082,7 +3560,7 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = old_root.file_eof_index().index();
+    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
     let mut blocks = Vec::new();
 
     let (hierarchy_data_bid, hierarchy_subnode_bid) =
@@ -3446,7 +3924,7 @@ fn append_unicode_pst(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    let mut next_offset = old_root.file_eof_index().index();
+    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
     header.root_mut().set_amap_status(AmapStatus::Invalid);
     header.update_unique();
     file.seek(SeekFrom::Start(0))?;
@@ -3531,27 +4009,52 @@ fn append_unicode_pst(
         .max(rows_node.index())
         .checked_add(1)
         .ok_or(PstError::IntegerConversion)?;
-    let ((contents_heap, row_chunks, row_ids), external_contents) = rebuild_contents_table(
-        contents_table.as_ref(),
-        inputs,
-        store_record_key,
-        folder,
-        &messages,
-        &message_sizes,
-        rows_node,
-        next_contents_subnode,
-        header.unique_value(),
-    )
+    let mut blocks = Vec::new();
+    let (contents_data_bid, rows_bid, row_count, external_contents) = (|| {
+        let (mut new_rows, external) = new_contents_rows(
+            contents_table.as_ref(),
+            inputs,
+            store_record_key,
+            folder,
+            &messages,
+            &message_sizes,
+            next_contents_subnode,
+            header.unique_value(),
+        )?;
+        let old_rows_bid = contents_subnodes
+            .iter()
+            .find(|entry| entry.node() == rows_node)
+            .map(|entry| entry.block());
+        if let Some((heap, rows, count)) = append_table_rows(
+            &mut file,
+            &bbt_entries,
+            contents_table.as_ref(),
+            contents_entry.data(),
+            old_rows_bid,
+            &mut new_rows,
+            header.unique_value(),
+            &mut blocks,
+            &mut next_bid,
+            &mut next_offset,
+        )? {
+            return Ok((heap, rows, count, external));
+        }
+        let (heap, rows, row_ids) = rebuild_table_with_rows_and_version(
+            contents_table.as_ref(),
+            new_rows,
+            Some(rows_node),
+            header.unique_value(),
+        )?;
+        let heap = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, heap)?;
+        let rows = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, rows)?;
+        Ok::<_, io::Error>((heap, rows, row_ids.len(), external))
+    })()
     .map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("rebuild receive-folder contents: {err}"),
         )
     })?;
-    let mut blocks = Vec::new();
-    let contents_data_bid =
-        push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, contents_heap)?;
-    let rows_bid = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, row_chunks)?;
     contents_subnodes.retain(|entry| entry.node() != rows_node);
     contents_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(rows_node, rows_bid, None));
     for (node, data) in external_contents {
@@ -3565,7 +4068,7 @@ fn append_unicode_pst(
         contents_subnodes,
     )?;
 
-    let content_count = i32::try_from(row_ids.len()).map_err(|_| PstError::IntegerConversion)?;
+    let content_count = i32::try_from(row_count).map_err(|_| PstError::IntegerConversion)?;
     set_folder_integer_property(&mut folder_properties, 0x3602, content_count);
     let next_property_subnode = folder_subnodes
         .iter()
@@ -3597,16 +4100,38 @@ fn append_unicode_pst(
     let parent_hierarchy_entry = if let Some((node, entry, table, mut subnodes, rows_node)) =
         parent_hierarchy
     {
-        let (pages, rows, _) = rebuild_table(
+        let old_rows = subnodes
+            .iter()
+            .find(|entry| entry.node() == rows_node)
+            .map(|entry| entry.block());
+        let patched = patch_table_row(
+            &mut file,
+            &bbt_entries,
             table.as_ref(),
-            vec![],
-            Some(rows_node),
+            old_rows,
+            folder,
+            &[(0x3602, PropertyValue::Integer32(content_count))],
             header.unique_value(),
-            Some((folder, 0x3602, PropertyValue::Integer32(content_count))),
-            true,
+            &mut blocks,
+            &mut next_bid,
+            &mut next_offset,
         )?;
-        let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
-        let rows = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, rows)?;
+        let (data, rows) = if let Some(rows) = patched {
+            (entry.data(), rows)
+        } else {
+            let (pages, rows, _) = rebuild_table(
+                table.as_ref(),
+                vec![],
+                Some(rows_node),
+                header.unique_value(),
+                Some((folder, 0x3602, PropertyValue::Integer32(content_count))),
+                true,
+            )?;
+            (
+                push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?,
+                push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, rows)?,
+            )
+        };
         subnodes.retain(|entry| entry.node() != rows_node);
         subnodes.push(UnicodeLeafSubNodeTreeEntry::new(rows_node, rows, None));
         let subnodes = push_subnode_tree(&mut blocks, &mut next_bid, &mut next_offset, subnodes)?;
@@ -3883,10 +4408,106 @@ mod create_tests {
     }
 
     #[test]
+    fn appends_contents_rows_incrementally_without_leaking_heap() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = |name: &str| {
+            std::env::temp_dir().join(format!(
+                "outlook-pst-incremental-{name}-{}-{stamp}.pst",
+                std::process::id()
+            ))
+        };
+        let ids = (0..1_700)
+            .map(|index| format!("<incremental-{index}@example.com>"))
+            .collect::<Vec<_>>();
+        let message = |index: usize| UnicodePstMessage {
+            subject: "incremental subject",
+            sender_name: "sender",
+            sender_email: "sender@example.com",
+            recipients: &[],
+            body: "body",
+            html_body: None,
+            message_id: &ids[index],
+            delivery_time: 133_750_080_000_000_000,
+        };
+        let batch = |range: std::ops::Range<usize>| range.map(message).collect::<Vec<_>>();
+        let heap_pages = |path: &Path| {
+            let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(path).unwrap())).unwrap();
+            let inbox = folder_at_path(&store, &["Inbox"]);
+            let contents = inbox.contents_table().unwrap();
+            assert_eq!(inbox.properties().content_count().unwrap(), 1_700);
+            let rows = contents.rows_matrix().collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1_700);
+            for row in &rows {
+                assert_eq!(contents.find_row(row.id()).unwrap().id(), row.id());
+            }
+            for row in [rows[0], rows[799], rows[1_699]] {
+                let node = NodeId::from(u32::from(row.id()));
+                let message = store
+                    .open_message(&store.properties().make_entry_id(node).unwrap(), None)
+                    .unwrap();
+                assert!(message.properties().get(0x0037).is_some());
+            }
+            let ipm_id = store.properties().ipm_sub_tree_entry_id().unwrap();
+            let ipm = store.open_folder(&ipm_id).unwrap();
+            let hierarchy = ipm.hierarchy_table().unwrap();
+            let inbox_id = find_child_folder(&store, ipm_id.node_id(), "Inbox")
+                .unwrap()
+                .unwrap();
+            let row = hierarchy
+                .find_row(TableRowId::new(u32::from(inbox_id)))
+                .unwrap();
+            let values = row.columns(hierarchy.context()).unwrap();
+            let (column, value) = hierarchy
+                .context()
+                .columns()
+                .iter()
+                .zip(&values)
+                .find(|(column, _)| column.prop_id() == 0x3602)
+                .unwrap();
+            assert!(matches!(
+                hierarchy.read_column(value.as_ref().unwrap(), column.prop_type()),
+                Ok(PropertyValue::Integer32(1_700))
+            ));
+            contents.writer_heap_pages().unwrap().len()
+        };
+
+        // One bulk call versus many small calls: the incremental path crosses row blocks, BTH
+        // leaves and a new BTH level, and must not leak heap pages per call.
+        let bulk = path("bulk");
+        drop(UnicodePstFile::create(&bulk, &message(0)).unwrap());
+        drop(UnicodePstFile::append_many(&bulk, &batch(1..1_700)).unwrap());
+        let calls = path("calls");
+        drop(UnicodePstFile::create(&calls, &message(0)).unwrap());
+        for start in (1..1_700).step_by(100) {
+            drop(
+                UnicodePstFile::append_many(&calls, &batch(start..(start + 100).min(1_700)))
+                    .unwrap(),
+            );
+        }
+        let (bulk_pages, call_pages) = (heap_pages(&bulk), heap_pages(&calls));
+        // Page-boundary padding costs at most about one BTH leaf per call; leaking the row index
+        // per call would add ~2 pages per call here.
+        assert!(call_pages <= bulk_pages + 4, "{call_pages} vs {bulk_pages}");
+        // Space freed by earlier calls (old B-trees, rewritten table blocks) is reused.
+        let size = |path: &Path| std::fs::metadata(path).unwrap().len();
+        assert!(
+            size(&calls) < size(&bulk) * 5 / 4,
+            "{} vs {}",
+            size(&calls),
+            size(&bulk)
+        );
+        std::fs::remove_file(bulk).unwrap();
+        std::fs::remove_file(calls).unwrap();
+    }
+
+    #[test]
     fn fills_nonfinal_data_tree_blocks() {
         let mut blocks = Vec::new();
         let mut next_bid = 1;
-        let mut next_offset = AMAP_FIRST_OFFSET;
+        let mut next_offset = FileSpace::from(AMAP_FIRST_OFFSET);
         let root = push_data_tree_chunks(
             &mut blocks,
             &mut next_bid,
@@ -3908,7 +4529,7 @@ mod create_tests {
     fn writes_local_totals_for_multilevel_data_trees() {
         let mut blocks = Vec::new();
         let mut next_bid = 1;
-        let mut next_offset = AMAP_FIRST_OFFSET;
+        let mut next_offset = FileSpace::from(AMAP_FIRST_OFFSET);
         let root = push_data_tree_chunks(
             &mut blocks,
             &mut next_bid,
@@ -3969,6 +4590,38 @@ mod create_tests {
             .seek(SeekFrom::Start(u64::from(page_map_offset)))
             .unwrap();
         HeapNodePageMap::read(&mut cursor).unwrap();
+        assert_eq!(cursor.position() as usize, pages[0].len());
+    }
+
+    #[test]
+    fn splits_heap_page_padding_at_the_hn_allocation_limit() {
+        // A 6000-byte allocation that does not fit leaves ~7 KiB of padding on the previous page.
+        let mut heap = HeapBuilder::new();
+        for _ in 0..40 {
+            heap.alloc(vec![0x5A; 100]).unwrap();
+        }
+        heap.alloc(vec![0x5A; 6_000]).unwrap();
+        let pages = heap
+            .finish(HeapNodeType::Properties, HeapId::default())
+            .unwrap();
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].len(), MAX_DATA_BLOCK_SIZE);
+        let mut cursor = Cursor::new(&pages[0]);
+        let page_map_offset = HeapNodeHeader::read(&mut cursor).unwrap().page_map_offset();
+        cursor
+            .seek(SeekFrom::Start(u64::from(page_map_offset)))
+            .unwrap();
+        let page_map = HeapNodePageMap::read(&mut cursor).unwrap();
+        let sizes = page_map
+            .allocations()
+            .iter()
+            .map(|allocation| usize::from(allocation.size()))
+            .collect::<Vec<_>>();
+        assert!(sizes[40..].len() > 1, "{sizes:?}");
+        assert!(sizes[40..]
+            .iter()
+            .all(|size| *size <= MAX_HN_ALLOCATION_SIZE));
         assert_eq!(cursor.position() as usize, pages[0].len());
     }
 
@@ -4700,7 +5353,7 @@ mod create_tests {
         ] {
             let mut metadata_offset = first;
             while metadata_offset < LIMIT {
-                let mut next_offset = metadata_offset;
+                let mut next_offset = FileSpace::from(metadata_offset);
                 let allocation =
                     reserve_file_range(&mut next_offset, PAGE_SIZE as u64, PAGE_SIZE as u64);
                 assert!(
