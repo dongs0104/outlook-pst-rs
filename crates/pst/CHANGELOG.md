@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- commit only the B-tree pages whose entries changed, and update block reference counts from the nodes and blocks a commit touched instead of re-reading every internal block
+- mark the allocation map from the commit's own block and page lists instead of re-reading both B-trees
+- flush to disk three times per commit instead of seven; new data only goes to space the committed allocation map marks free, so the committed state stays intact until the header switches roots
+
 ## [1.2.13] - 2026-10-14
 
 ### Added
