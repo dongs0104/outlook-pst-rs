@@ -3,10 +3,10 @@
 use byteorder::WriteBytesExt;
 use std::{
     cell::RefMut,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt::Debug,
     fs::{File, OpenOptions},
-    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     mem,
     path::Path,
     rc::Rc,
@@ -2304,64 +2304,114 @@ struct NewBTreePage {
     data: NewBTreePageData,
 }
 
+/// A B-tree as read from disk: each level's pages in key order with their items, so a commit
+/// can keep every page whose items did not change.
+struct BTreeLayout<E> {
+    leaves: BTreePages<E>,
+    /// Intermediate pages; `inner[0]` is level 1.
+    inner: Vec<BTreePages<(u64, UnicodePageRef)>>,
+}
+
+type BTreePages<T> = Vec<(UnicodePageRef, Vec<T>)>;
+
+/// Block `(offset, size)` and B-tree page offsets a commit already knows are allocated.
+type KnownAllocations<'a> = (&'a [(u64, u16)], &'a [u64]);
+
+enum BTreePageItems<E> {
+    Leaf(Vec<E>),
+    Intermediate(u8, Vec<(u64, UnicodePageRef)>),
+}
+
+impl<E: Copy + BTreeEntry<Key = u64>> BTreeLayout<E> {
+    fn read(
+        file: &mut File,
+        root: UnicodePageRef,
+        read_page: fn(&mut File, UnicodePageRef) -> io::Result<BTreePageItems<E>>,
+    ) -> io::Result<Self> {
+        let mut layout = Self {
+            leaves: Vec::new(),
+            inner: Vec::new(),
+        };
+        let mut stack = vec![(root, 0_u8)];
+        while let Some((page_ref, depth)) = stack.pop() {
+            if depth > 8 {
+                return Err(PstError::InvalidBTreePage(page_ref.index().index()).into());
+            }
+            match read_page(file, page_ref)? {
+                BTreePageItems::Leaf(entries) => layout.leaves.push((page_ref, entries)),
+                BTreePageItems::Intermediate(level, children) => {
+                    let level = usize::from(level.max(1));
+                    if layout.inner.len() < level {
+                        layout.inner.resize_with(level, Vec::new);
+                    }
+                    stack.extend(children.iter().rev().map(|(_, child)| (*child, depth + 1)));
+                    layout.inner[level - 1].push((page_ref, children));
+                }
+            }
+        }
+        Ok(layout)
+    }
+
+    fn entries(&self) -> Vec<E> {
+        let mut entries = self
+            .leaves
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().copied())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(BTreeEntry::key);
+        entries
+    }
+}
+
+fn read_block_btree(
+    file: &mut File,
+    root: UnicodePageRef,
+) -> io::Result<BTreeLayout<UnicodeBlockBTreeEntry>> {
+    BTreeLayout::read(file, root, |file, page_ref| {
+        Ok(match UnicodeBlockBTree::read(file, page_ref)? {
+            RootBTreePage::Leaf(page) => BTreePageItems::Leaf(page.entries().to_vec()),
+            RootBTreePage::Intermediate(page, ..) => BTreePageItems::Intermediate(
+                page.level(),
+                page.entries()
+                    .iter()
+                    .map(|entry| (entry.key(), entry.block()))
+                    .collect(),
+            ),
+        })
+    })
+}
+
+fn read_node_btree(
+    file: &mut File,
+    root: UnicodePageRef,
+) -> io::Result<BTreeLayout<UnicodeNodeBTreeEntry>> {
+    BTreeLayout::read(file, root, |file, page_ref| {
+        Ok(match UnicodeNodeBTree::read(file, page_ref)? {
+            RootBTreePage::Leaf(page) => BTreePageItems::Leaf(page.entries().to_vec()),
+            RootBTreePage::Intermediate(page, ..) => BTreePageItems::Intermediate(
+                page.level(),
+                page.entries()
+                    .iter()
+                    .map(|entry| (entry.key(), entry.block()))
+                    .collect(),
+            ),
+        })
+    })
+}
+
 fn collect_block_btree_entries(
     file: &mut File,
     page_ref: UnicodePageRef,
 ) -> io::Result<Vec<UnicodeBlockBTreeEntry>> {
-    fn visit(
-        file: &mut File,
-        page_ref: UnicodePageRef,
-        depth: u8,
-        entries: &mut Vec<UnicodeBlockBTreeEntry>,
-    ) -> io::Result<()> {
-        if depth > 8 {
-            return Err(PstError::InvalidBTreePage(page_ref.index().index()).into());
-        }
-        match UnicodeBlockBTree::read(file, page_ref)? {
-            RootBTreePage::Leaf(page) => entries.extend_from_slice(page.entries()),
-            RootBTreePage::Intermediate(page, ..) => {
-                for entry in page.entries() {
-                    visit(file, entry.block(), depth + 1, entries)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    let mut entries = Vec::new();
-    visit(file, page_ref, 0, &mut entries)?;
-    entries.sort_by_key(BTreeEntry::key);
-    Ok(entries)
+    Ok(read_block_btree(file, page_ref)?.entries())
 }
 
+#[cfg(test)]
 fn collect_node_btree_entries(
     file: &mut File,
     page_ref: UnicodePageRef,
 ) -> io::Result<Vec<UnicodeNodeBTreeEntry>> {
-    fn visit(
-        file: &mut File,
-        page_ref: UnicodePageRef,
-        depth: u8,
-        entries: &mut Vec<UnicodeNodeBTreeEntry>,
-    ) -> io::Result<()> {
-        if depth > 8 {
-            return Err(PstError::InvalidBTreePage(page_ref.index().index()).into());
-        }
-        match UnicodeNodeBTree::read(file, page_ref)? {
-            RootBTreePage::Leaf(page) => entries.extend_from_slice(page.entries()),
-            RootBTreePage::Intermediate(page, ..) => {
-                for entry in page.entries() {
-                    visit(file, entry.block(), depth + 1, entries)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    let mut entries = Vec::new();
-    visit(file, page_ref, 0, &mut entries)?;
-    entries.sort_by_key(BTreeEntry::key);
-    Ok(entries)
+    Ok(read_node_btree(file, page_ref)?.entries())
 }
 
 fn reserve_btree_page(
@@ -2378,13 +2428,90 @@ fn reserve_btree_page(
     Ok(page_ref)
 }
 
-fn plan_intermediate_btree_pages(
+fn same_btree_entry<E: BTreeEntryReadWrite>(left: &E, right: &E) -> bool {
+    let (mut a, mut b) = (Vec::with_capacity(32), Vec::with_capacity(32));
+    left.write(&mut a).is_ok() && right.write(&mut b).is_ok() && a == b
+}
+
+fn same_page_ref(left: &UnicodePageRef, right: &UnicodePageRef) -> bool {
+    left.block() == right.block() && left.index().index() == right.index().index()
+}
+
+/// Lay `items` out over the pages of one B-tree level. Each item goes to the old page whose
+/// key range holds it; a page whose items are unchanged is kept as is, any other is rewritten
+/// (split when it overflows). Returns the level's `(first key, page)` list in key order.
+fn plan_btree_level<T: Clone>(
+    old: &[(UnicodePageRef, Vec<T>)],
+    mut items: &[T],
+    key: impl Fn(&T) -> u64,
+    same: impl Fn(&T, &T) -> bool,
+    max: usize,
+    live: &mut Vec<u64>,
+    mut write: impl FnMut(Vec<T>) -> io::Result<UnicodePageRef>,
+) -> io::Result<Vec<(u64, UnicodePageRef)>> {
+    let mut level = Vec::new();
+    let mut place = |group: &[T], old_page: Option<&(UnicodePageRef, Vec<T>)>| {
+        if let Some((page, old_items)) = old_page {
+            if group.len() == old_items.len()
+                && group.iter().zip(old_items).all(|(a, b)| same(a, b))
+            {
+                live.push(page.index().index());
+                level.push((key(&group[0]), *page));
+                return Ok(());
+            }
+        }
+        for chunk in group.chunks(max) {
+            let page = write(chunk.to_vec())?;
+            live.push(page.index().index());
+            level.push((key(&chunk[0]), page));
+        }
+        Ok::<_, io::Error>(())
+    };
+    for (index, old_page) in old.iter().enumerate() {
+        let end = match old[index + 1..].iter().find_map(|(_, items)| items.first()) {
+            Some(next) => items.partition_point(|item| key(item) < key(next)),
+            None => items.len(),
+        };
+        let (group, rest) = items.split_at(end);
+        items = rest;
+        if !group.is_empty() {
+            place(group, Some(old_page))?;
+        }
+    }
+    if !items.is_empty() {
+        place(items, None)?;
+    }
+    Ok(level)
+}
+
+/// Plan a B-tree holding `entries`, rewriting only pages that differ from `old`. Every page
+/// of the new tree (kept or written) is appended to `live`.
+#[allow(clippy::too_many_arguments)]
+fn plan_btree<E: Copy + BTreeEntry<Key = u64> + BTreeEntryReadWrite>(
+    old: &BTreeLayout<E>,
+    entries: &[E],
+    leaf_max: usize,
     page_type: PageType,
-    mut children: Vec<(u64, UnicodePageRef)>,
+    leaf: fn(Vec<E>) -> NewBTreePageData,
     pages: &mut Vec<NewBTreePage>,
     next_page: &mut UnicodePageId,
     next_offset: &mut FileSpace,
+    live: &mut Vec<u64>,
 ) -> io::Result<UnicodePageRef> {
+    if entries.is_empty() {
+        let page = reserve_btree_page(pages, next_page, next_offset, leaf(Vec::new()))?;
+        live.push(page.index().index());
+        return Ok(page);
+    }
+    let mut children = plan_btree_level(
+        &old.leaves,
+        entries,
+        BTreeEntry::key,
+        same_btree_entry,
+        leaf_max,
+        live,
+        |chunk| reserve_btree_page(pages, next_page, next_offset, leaf(chunk)),
+    )?;
     let mut level = 1_u8;
     while children.len() > 1 {
         if level > 8 {
@@ -2393,76 +2520,33 @@ fn plan_intermediate_btree_pages(
                 "Unicode PST B-tree exceeds eight levels",
             ));
         }
-        children = children
-            .chunks(20)
-            .map(|chunk| {
-                let key = chunk[0].0;
+        let old_level = old
+            .inner
+            .get(usize::from(level) - 1)
+            .map_or(&[][..], Vec::as_slice);
+        children = plan_btree_level(
+            old_level,
+            &children,
+            |(key, _)| *key,
+            |(a_key, a_page), (b_key, b_page)| a_key == b_key && same_page_ref(a_page, b_page),
+            20,
+            live,
+            |chunk| {
                 let entries = chunk
                     .iter()
                     .map(|(key, page_ref)| UnicodeBTreePageEntry::new(*key, *page_ref))
                     .collect();
-                let page_ref = reserve_btree_page(
+                reserve_btree_page(
                     pages,
                     next_page,
                     next_offset,
                     NewBTreePageData::Intermediate(page_type, level, entries),
-                )?;
-                Ok((key, page_ref))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+                )
+            },
+        )?;
         level += 1;
     }
     Ok(children[0].1)
-}
-
-fn plan_block_btree(
-    entries: &[UnicodeBlockBTreeEntry],
-    pages: &mut Vec<NewBTreePage>,
-    next_page: &mut UnicodePageId,
-    next_offset: &mut FileSpace,
-) -> io::Result<UnicodePageRef> {
-    let children = entries
-        .chunks(20)
-        .map(|chunk| {
-            let key = chunk[0].key();
-            let page_ref = reserve_btree_page(
-                pages,
-                next_page,
-                next_offset,
-                NewBTreePageData::BlockLeaf(chunk.to_vec()),
-            )?;
-            Ok((key, page_ref))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    plan_intermediate_btree_pages(
-        PageType::BlockBTree,
-        children,
-        pages,
-        next_page,
-        next_offset,
-    )
-}
-
-fn plan_node_btree(
-    entries: &[UnicodeNodeBTreeEntry],
-    pages: &mut Vec<NewBTreePage>,
-    next_page: &mut UnicodePageId,
-    next_offset: &mut FileSpace,
-) -> io::Result<UnicodePageRef> {
-    let children = entries
-        .chunks(15)
-        .map(|chunk| {
-            let key = chunk[0].key();
-            let page_ref = reserve_btree_page(
-                pages,
-                next_page,
-                next_offset,
-                NewBTreePageData::NodeLeaf(chunk.to_vec()),
-            )?;
-            Ok((key, page_ref))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    plan_intermediate_btree_pages(PageType::NodeBTree, children, pages, next_page, next_offset)
 }
 
 fn write_btree_page(file: &mut File, page: NewBTreePage) -> io::Result<()> {
@@ -2831,7 +2915,81 @@ fn push_subnode_tree(
     Ok(level_entries[0].1)
 }
 
-fn write_new_block(file: &mut File, block: NewBlock) -> io::Result<()> {
+/// Encodes blocks in memory and sends each run of contiguous blocks to the file in one write.
+/// The block encoders write field by field, and on Windows every one of those small writes is a
+/// costly system call.
+#[derive(Default)]
+struct BlockWriter {
+    base: u64,
+    position: u64,
+    buffer: Vec<u8>,
+}
+
+impl BlockWriter {
+    const MAX_RUN: usize = 8 << 20;
+
+    fn push(&mut self, file: &mut File, block: NewBlock) -> io::Result<()> {
+        let end = self.base + self.buffer.len() as u64;
+        if !self.buffer.is_empty() && (block.offset != end || self.buffer.len() >= Self::MAX_RUN) {
+            self.flush(file)?;
+        }
+        if self.buffer.is_empty() {
+            self.base = block.offset;
+        }
+        write_new_block(self, block)
+    }
+
+    fn flush(&mut self, file: &mut File) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            file.seek(SeekFrom::Start(self.base))?;
+            file.write_all(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Write for BlockWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let start =
+            usize::try_from(self.position - self.base).map_err(|_| PstError::IntegerConversion)?;
+        let end = start + data.len();
+        if self.buffer.len() < end {
+            self.buffer.resize(end, 0);
+        }
+        self.buffer[start..end].copy_from_slice(data);
+        self.position += data.len() as u64;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for BlockWriter {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => {
+                (self.base + self.buffer.len() as u64).checked_add_signed(delta)
+            }
+        };
+        match target {
+            Some(offset) if offset >= self.base => {
+                self.position = offset;
+                Ok(offset)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block writes only seek within the current run",
+            )),
+        }
+    }
+}
+
+fn write_new_block<W: Write + Seek>(file: &mut W, block: NewBlock) -> io::Result<()> {
     let block_signature = block_sig::compute_sig(block.offset as u32, u64::from(block.id) as u32);
     let trailer = UnicodeBlockTrailer::new(block.size, block_signature, 0, block.id)?;
     file.seek(SeekFrom::Start(block.offset))?;
@@ -2957,13 +3115,17 @@ fn push_attachments(
     Ok(())
 }
 
-fn finish_unicode_pst_metadata(path: &Path) -> io::Result<()> {
+fn finish_unicode_pst_metadata(
+    path: &Path,
+    blocks: &[(u64, u16)],
+    pages: &[u64],
+) -> io::Result<()> {
     let mut pst = UnicodePstFile::open(path)?;
-    pst.inner.rebuild_allocation_map()?;
+    pst.inner
+        .rebuild_allocation_map_from(Some((blocks, pages)))?;
     pst.inner.ensure_density_list()?;
     pst.inner.finish_write()?;
-    drop(pst);
-    OpenOptions::new().write(true).open(path)?.sync_all()
+    Ok(())
 }
 
 fn create_unicode_pst(
@@ -3275,6 +3437,7 @@ fn collect_subnode_entries(
 
 fn write_pending_blocks(
     file: &mut File,
+    writer: &mut BlockWriter,
     bbt_entries: &mut Vec<UnicodeBlockBTreeEntry>,
     blocks: &mut Vec<NewBlock>,
 ) -> io::Result<()> {
@@ -3283,7 +3446,7 @@ fn write_pending_blocks(
             UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
             block.size,
         ));
-        write_new_block(file, block)?;
+        writer.push(file, block)?;
     }
     Ok(())
 }
@@ -3341,6 +3504,130 @@ fn record_block_reference(
     Ok(())
 }
 
+fn internal_block_children(
+    file: &mut File,
+    entry: &UnicodeBlockBTreeEntry,
+) -> io::Result<Vec<UnicodeBlockId>> {
+    file.seek(SeekFrom::Start(entry.block().index().index()))?;
+    let mut block_type = [0];
+    file.read_exact(&mut block_type)?;
+    Ok(match block_type[0] {
+        0x01 => match UnicodeDataTree::read(file, NdbCryptMethod::None, entry)? {
+            DataTree::Intermediate(tree) => {
+                tree.entries().iter().map(|entry| entry.block()).collect()
+            }
+            DataTree::Leaf(_) => unreachable!(),
+        },
+        0x02 => match UnicodeSubNodeTree::read(file, entry)? {
+            SubNodeTree::Intermediate(tree) => {
+                tree.entries().iter().map(|entry| entry.block()).collect()
+            }
+            SubNodeTree::Leaf(tree) => tree
+                .entries()
+                .iter()
+                .flat_map(|entry| [Some(entry.block()), entry.sub_node()])
+                .flatten()
+                .collect(),
+        },
+        value => return Err(NdbError::InvalidInternalBlockType(value).into()),
+    })
+}
+
+/// Update block reference counts from what this commit changed instead of walking every
+/// internal block: node entries replaced or added, new internal blocks, and internal blocks
+/// that lose their last reference. Returns false when the stored counts do not add up, so the
+/// caller can fall back to [`compact_unicode_block_tree`].
+fn update_block_ref_counts(
+    file: &mut File,
+    old_blocks: &[UnicodeBlockBTreeEntry],
+    old_nodes: &[UnicodeNodeBTreeEntry],
+    entries: &mut Vec<UnicodeBlockBTreeEntry>,
+    nodes: &[UnicodeNodeBTreeEntry],
+) -> io::Result<bool> {
+    entries.sort_by_key(BTreeEntry::key);
+    let mut delta = HashMap::<u64, i32>::new();
+    let add = |delta: &mut HashMap<u64, i32>, block: Option<UnicodeBlockId>, change| {
+        if let Some(key) = block
+            .map(|block| block.search_key())
+            .filter(|key| *key != 0)
+        {
+            *delta.entry(key).or_default() += change;
+        }
+    };
+
+    let (mut old, mut new) = (old_nodes.iter().peekable(), nodes.iter().peekable());
+    loop {
+        let order = match (old.peek(), new.peek()) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a.key().cmp(&b.key()),
+        };
+        let (removed, added) = match order {
+            std::cmp::Ordering::Less => (old.next(), None),
+            std::cmp::Ordering::Greater => (None, new.next()),
+            std::cmp::Ordering::Equal => {
+                let (a, b) = (old.next(), new.next());
+                if a.zip(b).is_some_and(|(a, b)| same_btree_entry(a, b)) {
+                    continue;
+                }
+                (a, b)
+            }
+        };
+        for (node, change) in [(removed, -1), (added, 1)] {
+            if let Some(node) = node {
+                add(&mut delta, Some(node.data()), change);
+                add(&mut delta, node.sub_node(), change);
+            }
+        }
+    }
+
+    let is_old = |key: u64| {
+        old_blocks
+            .binary_search_by_key(&key, BTreeEntry::key)
+            .is_ok()
+    };
+    for entry in entries.iter() {
+        if entry.block().block().is_internal() && !is_old(entry.key()) {
+            for child in internal_block_children(file, entry)? {
+                add(&mut delta, Some(child), 1);
+            }
+        }
+    }
+
+    let mut pending = delta.keys().copied().collect::<Vec<_>>();
+    let mut released = HashSet::new();
+    while let Some(key) = pending.pop() {
+        let Ok(index) = entries.binary_search_by_key(&key, BTreeEntry::key) else {
+            return Ok(false);
+        };
+        let count = i32::from(entries[index].ref_count()) + delta.get(&key).copied().unwrap_or(0);
+        if count < 1 {
+            return Ok(false);
+        }
+        if count == 1 && entries[index].block().block().is_internal() && released.insert(key) {
+            let entry = entries[index];
+            for child in internal_block_children(file, &entry)? {
+                add(&mut delta, Some(child), -1);
+                pending.push(child.search_key());
+            }
+        }
+    }
+
+    for (key, change) in &delta {
+        let index = entries
+            .binary_search_by_key(key, BTreeEntry::key)
+            .map_err(|_| PstError::IntegerConversion)?;
+        let count = i32::from(entries[index].ref_count()) + change;
+        let Ok(count) = u16::try_from(count) else {
+            return Ok(false);
+        };
+        entries[index].set_ref_count(count);
+    }
+    entries.retain(|entry| entry.ref_count() > 1 || !delta.contains_key(&entry.key()));
+    Ok(true)
+}
+
 fn compact_unicode_block_tree(
     file: &mut File,
     entries: &mut Vec<UnicodeBlockBTreeEntry>,
@@ -3371,31 +3658,7 @@ fn compact_unicode_block_tree(
         if !block.is_internal() {
             continue;
         }
-
-        file.seek(SeekFrom::Start(entry.block().index().index()))?;
-        let mut block_type = [0];
-        file.read_exact(&mut block_type)?;
-        let children: Vec<UnicodeBlockId> = match block_type[0] {
-            0x01 => match UnicodeDataTree::read(file, NdbCryptMethod::None, &entry)? {
-                DataTree::Intermediate(tree) => {
-                    tree.entries().iter().map(|entry| entry.block()).collect()
-                }
-                DataTree::Leaf(_) => unreachable!(),
-            },
-            0x02 => match UnicodeSubNodeTree::read(file, &entry)? {
-                SubNodeTree::Intermediate(tree) => {
-                    tree.entries().iter().map(|entry| entry.block()).collect()
-                }
-                SubNodeTree::Leaf(tree) => tree
-                    .entries()
-                    .iter()
-                    .flat_map(|entry| [Some(entry.block()), entry.sub_node()])
-                    .flatten()
-                    .collect(),
-            },
-            value => return Err(NdbError::InvalidInternalBlockType(value).into()),
-        };
-        for child in children {
+        for child in internal_block_children(file, &entry)? {
             record_block_reference(child, &mut references, &mut pending)?;
         }
     }
@@ -3418,6 +3681,8 @@ fn commit_unicode_changes(
     path: &Path,
     mut file: File,
     mut header: UnicodeHeader,
+    old_bbt: &BTreeLayout<UnicodeBlockBTreeEntry>,
+    old_nbt: &BTreeLayout<UnicodeNodeBTreeEntry>,
     mut bbt_entries: Vec<UnicodeBlockBTreeEntry>,
     mut nbt_entries: Vec<UnicodeNodeBTreeEntry>,
     blocks: Vec<NewBlock>,
@@ -3433,21 +3698,69 @@ fn commit_unicode_changes(
     }));
     nbt_entries.sort_by_key(BTreeEntry::key);
 
+    // New blocks and pages only go to space the committed allocation map marks free, so the
+    // committed state stays intact until the header switches roots: one barrier before that
+    // switch and one after it (the allocation map is invalid until it is rebuilt) suffice.
     header.root_mut().set_amap_status(AmapStatus::Invalid);
     header.update_unique();
-    file.seek(SeekFrom::Start(0))?;
-    header.write(&mut file)?;
-    file.sync_data()?;
+    let mut writer = BlockWriter::default();
     for block in blocks {
-        write_new_block(&mut file, block)?;
+        writer.push(&mut file, block)?;
     }
-    file.sync_data()?;
-    compact_unicode_block_tree(&mut file, &mut bbt_entries, &nbt_entries)?;
+    writer.flush(&mut file)?;
+    #[cfg(test)]
+    let before = bbt_entries.clone();
+    if !update_block_ref_counts(
+        &mut file,
+        &old_bbt.entries(),
+        &old_nbt.entries(),
+        &mut bbt_entries,
+        &nbt_entries,
+    )? {
+        compact_unicode_block_tree(&mut file, &mut bbt_entries, &nbt_entries)?;
+    }
+    #[cfg(test)]
+    {
+        let mut full = before;
+        compact_unicode_block_tree(&mut file, &mut full, &nbt_entries)?;
+        let counts = |entries: &[UnicodeBlockBTreeEntry]| {
+            entries
+                .iter()
+                .map(|entry| (entry.key(), entry.ref_count()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            counts(&bbt_entries),
+            counts(&full),
+            "incremental block ref counts"
+        );
+    }
 
     let mut pages = Vec::new();
     let mut next_page = header.next_page();
-    let bbt_ref = plan_block_btree(&bbt_entries, &mut pages, &mut next_page, &mut next_offset)?;
-    let nbt_ref = plan_node_btree(&nbt_entries, &mut pages, &mut next_page, &mut next_offset)?;
+    let mut live_pages = Vec::new();
+    let bbt_ref = plan_btree(
+        old_bbt,
+        &bbt_entries,
+        20,
+        PageType::BlockBTree,
+        NewBTreePageData::BlockLeaf,
+        &mut pages,
+        &mut next_page,
+        &mut next_offset,
+        &mut live_pages,
+    )?;
+    let nbt_ref = plan_btree(
+        old_nbt,
+        &nbt_entries,
+        15,
+        PageType::NodeBTree,
+        NewBTreePageData::NodeLeaf,
+        &mut pages,
+        &mut next_page,
+        &mut next_offset,
+        &mut live_pages,
+    )?;
     let new_eof = next_offset.eof;
     let amap_last =
         AMAP_FIRST_OFFSET + ((new_eof - AMAP_FIRST_OFFSET - 1) / AMAP_DATA_SIZE) * AMAP_DATA_SIZE;
@@ -3473,9 +3786,13 @@ fn commit_unicode_changes(
     header.update_unique();
     file.seek(SeekFrom::Start(0))?;
     header.write(&mut file)?;
-    file.sync_all()?;
+    file.sync_data()?;
     drop(file);
-    finish_unicode_pst_metadata(path)
+    let blocks = bbt_entries
+        .iter()
+        .map(|entry| (entry.block().index().index(), entry.size()))
+        .collect::<Vec<_>>();
+    finish_unicode_pst_metadata(path, &blocks, &live_pages)
 }
 
 fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
@@ -3494,8 +3811,10 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
         ));
     }
     let old_root = header.root().clone();
-    let bbt_entries = collect_block_btree_entries(&mut file, *old_root.block_btree())?;
-    let mut nbt_entries = collect_node_btree_entries(&mut file, *old_root.node_btree())?;
+    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    let bbt_entries = old_bbt.entries();
+    let mut nbt_entries = old_nbt.entries();
     let store_entry = nbt_entries
         .iter()
         .find(|entry| entry.node() == NID_MESSAGE_STORE)
@@ -3561,6 +3880,8 @@ fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
         path,
         file,
         header,
+        &old_bbt,
+        &old_nbt,
         bbt_entries,
         nbt_entries,
         blocks,
@@ -3580,8 +3901,10 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
         ));
     }
     let old_root = header.root().clone();
-    let bbt_entries = collect_block_btree_entries(&mut file, *old_root.block_btree())?;
-    let mut nbt_entries = collect_node_btree_entries(&mut file, *old_root.node_btree())?;
+    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    let bbt_entries = old_bbt.entries();
+    let mut nbt_entries = old_nbt.entries();
     let pst = Rc::new(UnicodePstFile::open(path)?);
     let store = UnicodeStore::read(pst)?;
     let store_record_key = *store.properties().record_key()?.record_key();
@@ -3848,6 +4171,8 @@ fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<
         path,
         file,
         header,
+        &old_bbt,
+        &old_nbt,
         bbt_entries,
         nbt_entries,
         blocks,
@@ -3903,8 +4228,10 @@ fn append_unicode_pst(
         ));
     }
     let old_root = header.root().clone();
-    let mut bbt_entries = collect_block_btree_entries(&mut file, *old_root.block_btree())?;
-    let mut nbt_entries = collect_node_btree_entries(&mut file, *old_root.node_btree())?;
+    let old_bbt = read_block_btree(&mut file, *old_root.block_btree())?;
+    let old_nbt = read_node_btree(&mut file, *old_root.node_btree())?;
+    let mut bbt_entries = old_bbt.entries();
+    let mut nbt_entries = old_nbt.entries();
 
     let pst = Rc::new(UnicodePstFile::open(path)?);
     let store = UnicodeStore::read(pst)
@@ -4023,13 +4350,10 @@ fn append_unicode_pst(
             .saturating_add(1),
     );
     let mut next_offset = FileSpace::read(&mut file, &old_root)?;
-    header.root_mut().set_amap_status(AmapStatus::Invalid);
     header.update_unique();
-    file.seek(SeekFrom::Start(0))?;
-    header.write(&mut file)?;
-    file.sync_data()?;
 
     let mut message_entries = Vec::with_capacity(inputs.len());
+    let mut block_writer = BlockWriter::default();
     for (position, ((input, message), message_size)) in
         inputs.iter().zip(&messages).zip(&message_sizes).enumerate()
     {
@@ -4075,7 +4399,7 @@ fn append_unicode_pst(
                 &mut next_offset,
                 message_subnodes,
             )?;
-            write_pending_blocks(&mut file, &mut bbt_entries, &mut blocks)?;
+            write_pending_blocks(&mut file, &mut block_writer, &mut bbt_entries, &mut blocks)?;
             Ok::<_, io::Error>(UnicodeNodeBTreeEntry::new(
                 *message,
                 message_bid,
@@ -4096,9 +4420,10 @@ fn append_unicode_pst(
             )
         })?);
     }
-    file.sync_data()?;
 
     // Cell subnodes are NID_TYPE_LTP and the row matrix is internal, so the next index counts every type.
+    block_writer.flush(&mut file)?;
+
     let next_contents_subnode = contents_subnodes
         .iter()
         .map(|entry| entry.node().index())
@@ -4280,6 +4605,8 @@ fn append_unicode_pst(
         path,
         file,
         header,
+        &old_bbt,
+        &old_nbt,
         bbt_entries,
         nbt_entries,
         blocks,
@@ -5590,6 +5917,44 @@ mod create_tests {
         let inbox = folder_at_path(&store, &["Inbox"]);
         assert_eq!(inbox.properties().content_count().unwrap(), 20);
         assert_eq!(inbox.contents_table().unwrap().rows_matrix().count(), 20);
+        drop((inbox, store));
+
+        // The allocation map a commit marks from memory equals the spec's B-tree walk rebuild.
+        let amap_pages = |path: &Path| {
+            let mut file = File::open(path).unwrap();
+            let eof = UnicodeHeader::read(&mut file)
+                .unwrap()
+                .root()
+                .file_eof_index()
+                .index();
+            let mut pages = Vec::new();
+            for offset in (AMAP_FIRST_OFFSET..eof).step_by(AMAP_DATA_SIZE as usize) {
+                let mut page = [0; PAGE_SIZE];
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.read_exact(&mut page).unwrap();
+                pages.push(page);
+            }
+            pages
+        };
+        let written = amap_pages(&path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut header = UnicodeHeader::read(&mut file).unwrap();
+        header.root_mut().set_amap_status(AmapStatus::Invalid);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        header.write(&mut file).unwrap();
+        drop(file);
+        let mut pst = UnicodePstFile::open(&path).unwrap();
+        pst.inner.rebuild_allocation_map().unwrap();
+        drop(pst);
+        assert!(written.len() > 1);
+        assert!(
+            written == amap_pages(&path),
+            "allocation map differs from a rebuild"
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -6048,6 +6413,15 @@ where
 
     /// [Crash Recovery and AMap Rebuilding](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/d9bcc1fd-c66a-41b3-b6d7-ed09d2a25ced)
     fn rebuild_allocation_map(&mut self) -> io::Result<()> {
+        self.rebuild_allocation_map_from(None)
+    }
+
+    /// Rebuild the allocation map, marking `known` blocks `(offset, size)` and B-tree page
+    /// offsets when the caller already has them instead of walking both B-trees on disk.
+    fn rebuild_allocation_map_from(
+        &mut self,
+        known: Option<KnownAllocations<'_>>,
+    ) -> io::Result<()> {
         let root = self.header.root();
         if AmapStatus::Invalid != root.amap_is_valid() {
             return Ok(());
@@ -6091,7 +6465,14 @@ where
             })
             .collect::<PstResult<Vec<_>>>()?;
 
-        {
+        if let Some((blocks, pages)) = known {
+            for page in pages {
+                Self::mark_page_allocation(*page, &mut amap_pages)?;
+            }
+            for (offset, size) in blocks {
+                Self::mark_block_allocation(*offset, *size, &mut amap_pages)?;
+            }
+        } else {
             let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
             let reader = &mut *reader;
 
@@ -6212,36 +6593,66 @@ where
             .collect::<PstResult<Vec<_>>>()?;
 
         {
+            // Encode every map page, then write only those that differ from the file: the maps
+            // sit one per 248 KiB, so rewriting all of them scatters thousands of page writes
+            // over a large file, which a slow disk then has to flush.
+            let mut encoded: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut encode =
+                |offset: u64, write: &dyn Fn(&mut Cursor<Vec<u8>>) -> io::Result<()>| {
+                    let mut page = Cursor::new(Vec::with_capacity(PAGE_SIZE));
+                    write(&mut page)?;
+                    encoded.push((offset, page.into_inner()));
+                    Ok::<_, io::Error>(())
+                };
+            for page in amap_pages.into_iter().map(|info| info.amap_page) {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::AllocationMapPage as AllocationMapPageReadWrite<Pst>>::write(&page, f)
+                })?;
+            }
+            for page in pmap_pages.into_iter() {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::AllocationPageMapPage as AllocationPageMapPageReadWrite<Pst>>::write(
+                        &page, f,
+                    )
+                })?;
+            }
+            for page in fmap_pages.into_iter() {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::FreeMapPage as FreeMapPageReadWrite<Pst>>::write(&page, f)
+                })?;
+            }
+            for page in fpmap_pages.into_iter() {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::FreePageMapPage as FreePageMapPageReadWrite<Pst>>::write(&page, f)
+                })?;
+            }
+
+            {
+                let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
+                let mut current = vec![0; PAGE_SIZE];
+                encoded.retain(|(offset, page)| {
+                    current.resize(page.len(), 0);
+                    let unchanged = reader.seek(SeekFrom::Start(*offset)).is_ok()
+                        && reader.read_exact(&mut current).is_ok()
+                        && current == *page;
+                    !unchanged
+                });
+            }
+
             let mut writer = self
                 .writer
                 .as_ref()?
                 .lock()
                 .map_err(|_| PstError::LockError)?;
             let writer = &mut *writer;
-
-            for page in amap_pages.into_iter().map(|info| info.amap_page) {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::AllocationMapPage as AllocationMapPageReadWrite<Pst>>::write(&page, writer)?;
-            }
-
-            for page in pmap_pages.into_iter() {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::AllocationPageMapPage as AllocationPageMapPageReadWrite<Pst>>::write(
-                    &page, writer,
-                )?;
-            }
-
-            for page in fmap_pages.into_iter() {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::FreeMapPage as FreeMapPageReadWrite<Pst>>::write(&page, writer)?;
-            }
-
-            for page in fpmap_pages.into_iter() {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::FreePageMapPage as FreePageMapPageReadWrite<Pst>>::write(&page, writer)?;
+            for (offset, page) in encoded {
+                writer.seek(SeekFrom::Start(offset))?;
+                writer.write_all(&page)?;
             }
 
             writer.flush()?;
+            // The maps must be durable before the header marks them valid.
+            writer.get_ref().sync_data()?;
         }
 
         let header = {
