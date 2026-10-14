@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.14] - 2026-10-15
+
 ### Changed
 
+- write each run of contiguous new blocks in one system call instead of the encoders' field-sized writes (about 270,000 writes for 17,000 messages with attachments); block padding is now zero-filled
+- write only the allocation map pages a commit changed instead of every AMap/PMap/FMap/FPMap page; on a slow disk the flush of thousands of scattered map pages per append dominated large exports (17,000 messages on a Windows VM: 172 s to 61 s)
 - commit only the B-tree pages whose entries changed, and update block reference counts from the nodes and blocks a commit touched instead of re-reading every internal block
 - mark the allocation map from the commit's own block and page lists instead of re-reading both B-trees
 - flush to disk three times per commit instead of seven; new data only goes to space the committed allocation map marks free, so the committed state stays intact until the header switches roots
