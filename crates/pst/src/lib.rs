@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt::Debug,
     fs::{File, OpenOptions},
-    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     mem,
     path::Path,
     rc::Rc,
@@ -6593,33 +6593,61 @@ where
             .collect::<PstResult<Vec<_>>>()?;
 
         {
+            // Encode every map page, then write only those that differ from the file: the maps
+            // sit one per 248 KiB, so rewriting all of them scatters thousands of page writes
+            // over a large file, which a slow disk then has to flush.
+            let mut encoded: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut encode =
+                |offset: u64, write: &dyn Fn(&mut Cursor<Vec<u8>>) -> io::Result<()>| {
+                    let mut page = Cursor::new(Vec::with_capacity(PAGE_SIZE));
+                    write(&mut page)?;
+                    encoded.push((offset, page.into_inner()));
+                    Ok::<_, io::Error>(())
+                };
+            for page in amap_pages.into_iter().map(|info| info.amap_page) {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::AllocationMapPage as AllocationMapPageReadWrite<Pst>>::write(&page, f)
+                })?;
+            }
+            for page in pmap_pages.into_iter() {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::AllocationPageMapPage as AllocationPageMapPageReadWrite<Pst>>::write(
+                        &page, f,
+                    )
+                })?;
+            }
+            for page in fmap_pages.into_iter() {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::FreeMapPage as FreeMapPageReadWrite<Pst>>::write(&page, f)
+                })?;
+            }
+            for page in fpmap_pages.into_iter() {
+                encode(page.trailer().block_id().into_u64(), &|f| {
+                    <Pst::FreePageMapPage as FreePageMapPageReadWrite<Pst>>::write(&page, f)
+                })?;
+            }
+
+            {
+                let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
+                let mut current = vec![0; PAGE_SIZE];
+                encoded.retain(|(offset, page)| {
+                    current.resize(page.len(), 0);
+                    let unchanged = reader.seek(SeekFrom::Start(*offset)).is_ok()
+                        && reader.read_exact(&mut current).is_ok()
+                        && current == *page;
+                    !unchanged
+                });
+            }
+
             let mut writer = self
                 .writer
                 .as_ref()?
                 .lock()
                 .map_err(|_| PstError::LockError)?;
             let writer = &mut *writer;
-
-            for page in amap_pages.into_iter().map(|info| info.amap_page) {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::AllocationMapPage as AllocationMapPageReadWrite<Pst>>::write(&page, writer)?;
-            }
-
-            for page in pmap_pages.into_iter() {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::AllocationPageMapPage as AllocationPageMapPageReadWrite<Pst>>::write(
-                    &page, writer,
-                )?;
-            }
-
-            for page in fmap_pages.into_iter() {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::FreeMapPage as FreeMapPageReadWrite<Pst>>::write(&page, writer)?;
-            }
-
-            for page in fpmap_pages.into_iter() {
-                writer.seek(SeekFrom::Start(page.trailer().block_id().into_u64()))?;
-                <Pst::FreePageMapPage as FreePageMapPageReadWrite<Pst>>::write(&page, writer)?;
+            for (offset, page) in encoded {
+                writer.seek(SeekFrom::Start(offset))?;
+                writer.write_all(&page)?;
             }
 
             writer.flush()?;
