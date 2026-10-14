@@ -648,9 +648,7 @@ const FPMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_PAGE_COUNT;
 
 const MAX_DATA_BLOCK_SIZE: usize =
     (ndb::block::MAX_BLOCK_SIZE - UnicodeBlockTrailer::SIZE) as usize;
-// Largest value that fits on an empty continuation HN page with its aligned page map.
-const MAX_HEAP_ALLOCATION_SIZE: usize = MAX_DATA_BLOCK_SIZE - 15;
-// MS-PST limit for one HN allocation. SCANPST stops on padding above it (Fatal Error 80040813).
+// MS-PST limit for one HN allocation. Outlook never writes above it; SCANPST stops on padding above it (Fatal Error 80040813). Larger values go to subnodes and BTH nodes are split to stay below it.
 const MAX_HN_ALLOCATION_SIZE: usize = 3580;
 
 const OUTLOOK_UNICODE_PST_TEMPLATE: &[u8] = include_bytes!("../examples/Empty.pst");
@@ -769,7 +767,7 @@ impl HeapBuilder {
     }
 
     fn alloc(&mut self, data: Vec<u8>) -> io::Result<HeapId> {
-        if data.len() > MAX_HEAP_ALLOCATION_SIZE {
+        if data.len() > MAX_HN_ALLOCATION_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "heap allocation exceeds one Unicode PST data block",
@@ -947,7 +945,7 @@ fn build_property_tree(
     records: &[(u16, PropertyType, PropertyValueRecord)],
 ) -> io::Result<HeapId> {
     let mut children = records
-        .chunks(750)
+        .chunks(MAX_HN_ALLOCATION_SIZE / 8)
         .map(|chunk| {
             let mut data = Vec::with_capacity(chunk.len() * 8);
             for (id, prop_type, value) in chunk {
@@ -959,7 +957,7 @@ fn build_property_tree(
     let mut levels = 0;
     while children.len() > 1 {
         children = children
-            .chunks(900)
+            .chunks(MAX_HN_ALLOCATION_SIZE / 6)
             .map(|chunk| {
                 let mut data = Vec::with_capacity(chunk.len() * 6);
                 for (key, child) in chunk {
@@ -993,7 +991,7 @@ fn property_context_pages(
                 let data = property_value_bytes(&value)?;
                 if data.is_empty() {
                     PropertyValueRecord::Heap(HeapId::default())
-                } else if data.len() > MAX_HEAP_ALLOCATION_SIZE {
+                } else if data.len() > MAX_HN_ALLOCATION_SIZE {
                     let node = NodeId::new(NodeIdType::Internal, next_subnode_index)?;
                     next_subnode_index = next_subnode_index
                         .checked_add(1)
@@ -1147,7 +1145,7 @@ where
     heap.alloc(header)
 }
 
-const ROW_INDEX_FANOUT: usize = 750;
+const ROW_INDEX_FANOUT: usize = MAX_HN_ALLOCATION_SIZE / 8;
 
 /// Stack intermediate levels over `children` (`(first row id, node)`) and encode the BTH header.
 fn row_index_header(
@@ -1649,8 +1647,9 @@ fn new_contents_rows(
                 let TableCell::Bytes(data) = cell else {
                     continue;
                 };
-                if data.len() > MAX_HEAP_ALLOCATION_SIZE {
-                    let node = NodeId::new(NodeIdType::Internal, next_subnode_index)?;
+                if data.len() > MAX_HN_ALLOCATION_SIZE {
+                    // Outlook only follows a table cell into a subnode of type NID_TYPE_LTP; an internal NID makes GetTable fail.
+                    let node = NodeId::new(NodeIdType::ListsTablesProperties, next_subnode_index)?;
                     next_subnode_index = next_subnode_index
                         .checked_add(1)
                         .ok_or(PstError::IntegerConversion)?;
@@ -4000,9 +3999,9 @@ fn append_unicode_pst(
     }
     file.sync_data()?;
 
+    // Cell subnodes are NID_TYPE_LTP and the row matrix is internal, so the next index counts every type.
     let next_contents_subnode = contents_subnodes
         .iter()
-        .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
         .map(|entry| entry.node().index())
         .max()
         .unwrap_or(0)
@@ -4276,6 +4275,9 @@ mod create_tests {
 
         let reopened = UnicodePstFile::open(&path).unwrap();
         assert_eq!(reopened.header().version(), NdbVersion::Unicode);
+        // rgbFM (0x100..0x180) and rgbFP (0x180..0x200) are deprecated and MUST be 0xFF.
+        let header = std::fs::read(&path).unwrap();
+        assert!(header[0x100..0x200].iter().all(|byte| *byte == 0xFF));
         let store = UnicodeStore::read(Rc::new(reopened)).unwrap();
         let inbox = folder_at_path(&store, &["Inbox"]);
         assert_eq!(inbox.properties().display_name().unwrap(), "Inbox");
@@ -4362,7 +4364,7 @@ mod create_tests {
             })
             .collect::<Vec<_>>();
         let display_to = recipient_display(&recipients, UnicodePstRecipientType::To);
-        assert!(utf16_bytes(&display_to).len() > MAX_HEAP_ALLOCATION_SIZE);
+        assert!(utf16_bytes(&display_to).len() > MAX_HN_ALLOCATION_SIZE);
         let input = UnicodePstMessage {
             subject: "large recipient display",
             sender_name: "sender",
@@ -4380,6 +4382,7 @@ mod create_tests {
         let inbox = folder_at_path(&store, &["Inbox"]);
         assert_eq!(inbox.properties().content_count().unwrap(), 3);
         let contents = inbox.contents_table().unwrap();
+        let mut cell_nodes = std::collections::HashSet::new();
         for row in contents.rows_matrix() {
             let values = row.columns(contents.context()).unwrap();
             let (column, value) = contents
@@ -4389,7 +4392,18 @@ mod create_tests {
                 .zip(&values)
                 .find(|(column, _)| column.prop_id() == 0x0E04)
                 .unwrap();
-            assert!(matches!(value, Some(TableRowColumnValue::Node(_))));
+            let Some(TableRowColumnValue::Node(node)) = value else {
+                panic!("display-to cell is not in a subnode: {value:?}");
+            };
+            // Outlook fails GetTable unless cell subnodes are NID_TYPE_LTP, and appends must not reuse a NID.
+            assert!(matches!(
+                node.id_type(),
+                Ok(NodeIdType::ListsTablesProperties)
+            ));
+            assert!(
+                cell_nodes.insert(u32::from(*node)),
+                "duplicate cell subnode"
+            );
             match contents
                 .read_column(value.as_ref().unwrap(), column.prop_type())
                 .unwrap()
@@ -4438,6 +4452,13 @@ mod create_tests {
             let inbox = folder_at_path(&store, &["Inbox"]);
             let contents = inbox.contents_table().unwrap();
             assert_eq!(inbox.properties().content_count().unwrap(), 1_700);
+            // MS-PST caps every HN allocation, row index nodes and page padding included, at 3580 bytes.
+            assert!(contents
+                .writer_heap_pages()
+                .unwrap()
+                .iter()
+                .flatten()
+                .all(|allocation| allocation.len() <= MAX_HN_ALLOCATION_SIZE));
             let rows = contents.rows_matrix().collect::<Vec<_>>();
             assert_eq!(rows.len(), 1_700);
             for row in &rows {
@@ -4595,12 +4616,12 @@ mod create_tests {
 
     #[test]
     fn splits_heap_page_padding_at_the_hn_allocation_limit() {
-        // A 6000-byte allocation that does not fit leaves ~7 KiB of padding on the previous page.
+        // A maximal allocation that misses the first page by its page map entry leaves 3584 free bytes, more than one padding allocation may hold.
         let mut heap = HeapBuilder::new();
-        for _ in 0..40 {
-            heap.alloc(vec![0x5A; 100]).unwrap();
+        for _ in 0..2 {
+            heap.alloc(vec![0x5A; 2_285]).unwrap();
         }
-        heap.alloc(vec![0x5A; 6_000]).unwrap();
+        heap.alloc(vec![0x5A; MAX_HN_ALLOCATION_SIZE]).unwrap();
         let pages = heap
             .finish(HeapNodeType::Properties, HeapId::default())
             .unwrap();
@@ -4618,8 +4639,8 @@ mod create_tests {
             .iter()
             .map(|allocation| usize::from(allocation.size()))
             .collect::<Vec<_>>();
-        assert!(sizes[40..].len() > 1, "{sizes:?}");
-        assert!(sizes[40..]
+        assert!(sizes[2..].len() > 1, "{sizes:?}");
+        assert!(sizes[2..]
             .iter()
             .all(|size| *size <= MAX_HN_ALLOCATION_SIZE));
         assert_eq!(cursor.position() as usize, pages[0].len());
@@ -5567,7 +5588,7 @@ mod create_tests {
 
     #[test]
     fn externalizes_large_folder_properties() {
-        let value = vec![0x5A; MAX_HEAP_ALLOCATION_SIZE + 1];
+        let value = vec![0x5A; MAX_HN_ALLOCATION_SIZE + 1];
         let (pages, external) = property_context_pages(
             [(
                 0x300B,
@@ -5965,14 +5986,6 @@ where
             .map_err(|_| PstError::IntegerConversion)?;
         let free_bytes = <<Pst as PstFile>::ByteIndex as ByteIndexReadWrite>::new(free_bytes);
 
-        let mut first_fmap = [0; FMAP_FIRST_SIZE as usize];
-        for (entry, free_space) in first_fmap
-            .iter_mut()
-            .zip(amap_pages.iter().map(|page| page.max_free_slots()))
-        {
-            *entry = free_space;
-        }
-
         let pmap_pages: Vec<_> = (0..num_amap_pages.div_ceil(PMAP_PAGE_COUNT))
             .map(|index| {
                 let index =
@@ -6095,8 +6108,13 @@ where
         }
 
         let header = {
+            // MS-PST deprecates the header's rgbFM and rgbFP: they MUST be 0xFF, which is what Outlook writes and SCANPST restores.
             <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::first_free_map(&mut self.header)
-                .copy_from_slice(&first_fmap);
+                .fill(0xFF);
+            <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::first_free_page_map(
+                &mut self.header,
+            )
+            .fill(0xFF);
             self.header.update_unique();
 
             let root = self.header.root_mut();
