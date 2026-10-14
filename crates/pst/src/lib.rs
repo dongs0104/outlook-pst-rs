@@ -328,6 +328,13 @@ impl UnicodePstFile {
         Self::open(path)
     }
 
+    /// Set the store display name (PR_DISPLAY_NAME of the message store) of an existing
+    /// unencrypted Unicode PST. Outlook shows it as the top-level name when the file is opened.
+    pub fn set_store_display_name(path: impl AsRef<Path>, name: &str) -> io::Result<Self> {
+        set_unicode_store_display_name(path.as_ref(), name)?;
+        Self::open(path)
+    }
+
     /// Append one message to the default receive folder (normally Inbox) of an
     /// existing unencrypted Unicode PST.
     pub fn append(path: impl AsRef<Path>, message: &UnicodePstMessage<'_>) -> io::Result<Self> {
@@ -3471,6 +3478,98 @@ fn commit_unicode_changes(
     finish_unicode_pst_metadata(path)
 }
 
+fn set_unicode_store_display_name(path: &Path, name: &str) -> io::Result<()> {
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "store display name must not be empty",
+        ));
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let header = UnicodeHeader::read(&mut file)?;
+    if header.crypt_method() != NdbCryptMethod::None {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "store renaming only supports unencrypted Unicode PSTs",
+        ));
+    }
+    let old_root = header.root().clone();
+    let bbt_entries = collect_block_btree_entries(&mut file, *old_root.block_btree())?;
+    let mut nbt_entries = collect_node_btree_entries(&mut file, *old_root.node_btree())?;
+    let store_entry = nbt_entries
+        .iter()
+        .find(|entry| entry.node() == NID_MESSAGE_STORE)
+        .copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "message store node not found"))?;
+    let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(path)?))?;
+    let mut properties: Vec<_> = store
+        .properties()
+        .iter()
+        .filter(|(id, _)| **id != 0x3001)
+        .map(|(id, value)| (*id, value.clone()))
+        .collect();
+    properties.push((
+        0x3001,
+        PropertyValue::Unicode(UnicodeValue::new(name.encode_utf16().collect())),
+    ));
+
+    let mut next_bid = header.next_block().index().max(
+        bbt_entries
+            .iter()
+            .map(|entry| entry.block().block().index())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    let mut next_offset = FileSpace::read(&mut file, &old_root)?;
+    let mut blocks = Vec::new();
+    let mut subnodes =
+        collect_subnode_entries(&mut file, *old_root.block_btree(), store_entry.sub_node())?;
+    let next_property_subnode = subnodes
+        .iter()
+        .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
+        .map(|entry| entry.node().index())
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(PstError::IntegerConversion)?;
+    let (pages, external_properties) = property_context_pages(properties, next_property_subnode)?;
+    let data = push_data_tree_chunks(&mut blocks, &mut next_bid, &mut next_offset, pages)?;
+    for (node, value) in external_properties {
+        let value = push_data_tree(&mut blocks, &mut next_bid, &mut next_offset, &value)?;
+        subnodes.push(UnicodeLeafSubNodeTreeEntry::new(node, value, None));
+    }
+    let subnode = if subnodes.is_empty() {
+        None
+    } else {
+        Some(push_subnode_tree(
+            &mut blocks,
+            &mut next_bid,
+            &mut next_offset,
+            subnodes,
+        )?)
+    };
+    nbt_entries.retain(|entry| entry.node() != NID_MESSAGE_STORE);
+    nbt_entries.push(UnicodeNodeBTreeEntry::new(
+        NID_MESSAGE_STORE,
+        data,
+        subnode,
+        store_entry.parent(),
+    ));
+
+    commit_unicode_changes(
+        path,
+        file,
+        header,
+        bbt_entries,
+        nbt_entries,
+        blocks,
+        next_bid,
+        next_offset,
+        &[],
+    )
+}
+
 fn create_unicode_folder(path: &Path, parent: NodeId, name: &str) -> io::Result<NodeId> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let header = UnicodeHeader::read(&mut file)?;
@@ -4245,6 +4344,44 @@ mod create_tests {
         store
             .open_folder(&store.properties().make_entry_id(folder).unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn sets_the_store_display_name_and_keeps_appending() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "outlook-pst-store-name-{}-{stamp}.pst",
+            std::process::id()
+        ));
+        let input = UnicodePstMessage {
+            subject: "Store name",
+            sender_name: "Memex Sender",
+            sender_email: "sender@example.com",
+            recipients: TEST_RECIPIENTS,
+            body: "Body",
+            html_body: None,
+            message_id: "<store-name@example.com>",
+            delivery_time: 133_750_080_000_000_000,
+        };
+        drop(UnicodePstFile::create(&path, &input).unwrap());
+        assert!(UnicodePstFile::set_store_display_name(&path, "").is_err());
+        drop(UnicodePstFile::set_store_display_name(&path, "d0104.shin").unwrap());
+        drop(UnicodePstFile::append(&path, &input).unwrap());
+
+        let store = UnicodeStore::read(Rc::new(UnicodePstFile::open(&path).unwrap())).unwrap();
+        assert_eq!(store.properties().display_name().unwrap(), "d0104.shin");
+        assert!(store.properties().record_key().is_ok());
+        assert_eq!(
+            folder_at_path(&store, &["Inbox"])
+                .properties()
+                .content_count()
+                .unwrap(),
+            2
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

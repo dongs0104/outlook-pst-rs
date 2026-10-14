@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.13] - 2026-10-14
+
+### Added
+
+- `UnicodePstFile::set_store_display_name` sets the message store PR_DISPLAY_NAME, which Outlook shows as the top-level name of an opened PST; new files otherwise keep the template name "Empty"
+
 ## [1.2.12] - 2026-10-14
 
 ### Fixed
