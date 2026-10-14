@@ -4382,6 +4382,7 @@ mod create_tests {
         let inbox = folder_at_path(&store, &["Inbox"]);
         assert_eq!(inbox.properties().content_count().unwrap(), 3);
         let contents = inbox.contents_table().unwrap();
+        let mut cell_nodes = std::collections::HashSet::new();
         for row in contents.rows_matrix() {
             let values = row.columns(contents.context()).unwrap();
             let (column, value) = contents
@@ -4391,7 +4392,18 @@ mod create_tests {
                 .zip(&values)
                 .find(|(column, _)| column.prop_id() == 0x0E04)
                 .unwrap();
-            assert!(matches!(value, Some(TableRowColumnValue::Node(_))));
+            let Some(TableRowColumnValue::Node(node)) = value else {
+                panic!("display-to cell is not in a subnode: {value:?}");
+            };
+            // Outlook fails GetTable unless cell subnodes are NID_TYPE_LTP, and appends must not reuse a NID.
+            assert!(matches!(
+                node.id_type(),
+                Ok(NodeIdType::ListsTablesProperties)
+            ));
+            assert!(
+                cell_nodes.insert(u32::from(*node)),
+                "duplicate cell subnode"
+            );
             match contents
                 .read_column(value.as_ref().unwrap(), column.prop_type())
                 .unwrap()

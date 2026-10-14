@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.12] - 2026-10-14
+
+### Fixed
+
+- store large contents-table cells (such as the display-to list of a mass mail) in NID_TYPE_LTP subnodes; internal-type cell subnodes made Outlook fail to load the folder's contents table, so the folder showed no items
+- count every subnode type when numbering new contents-table subnodes so appended cell subnodes never reuse a NID
+- keep every heap allocation, row-index and property-tree node within the MS-PST 3580-byte limit and move larger values to subnodes; heap cells above it made SCANPST stop with Fatal Error 80040813
+- fill the deprecated header fields rgbFM and rgbFP with 0xFF as MS-PST requires and Outlook writes
+
 ## [1.2.11] - 2026-10-13
 
 ### Fixed
