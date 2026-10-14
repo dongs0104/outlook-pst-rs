@@ -1648,7 +1648,8 @@ fn new_contents_rows(
                     continue;
                 };
                 if data.len() > MAX_HN_ALLOCATION_SIZE {
-                    let node = NodeId::new(NodeIdType::Internal, next_subnode_index)?;
+                    // Outlook only follows a table cell into a subnode of type NID_TYPE_LTP; an internal NID makes GetTable fail.
+                    let node = NodeId::new(NodeIdType::ListsTablesProperties, next_subnode_index)?;
                     next_subnode_index = next_subnode_index
                         .checked_add(1)
                         .ok_or(PstError::IntegerConversion)?;
@@ -3998,9 +3999,9 @@ fn append_unicode_pst(
     }
     file.sync_data()?;
 
+    // Cell subnodes are NID_TYPE_LTP and the row matrix is internal, so the next index counts every type.
     let next_contents_subnode = contents_subnodes
         .iter()
-        .filter(|entry| matches!(entry.node().id_type(), Ok(NodeIdType::Internal)))
         .map(|entry| entry.node().index())
         .max()
         .unwrap_or(0)
@@ -4274,6 +4275,9 @@ mod create_tests {
 
         let reopened = UnicodePstFile::open(&path).unwrap();
         assert_eq!(reopened.header().version(), NdbVersion::Unicode);
+        // rgbFM (0x100..0x180) and rgbFP (0x180..0x200) are deprecated and MUST be 0xFF.
+        let header = std::fs::read(&path).unwrap();
+        assert!(header[0x100..0x200].iter().all(|byte| *byte == 0xFF));
         let store = UnicodeStore::read(Rc::new(reopened)).unwrap();
         let inbox = folder_at_path(&store, &["Inbox"]);
         assert_eq!(inbox.properties().display_name().unwrap(), "Inbox");
@@ -5970,14 +5974,6 @@ where
             .map_err(|_| PstError::IntegerConversion)?;
         let free_bytes = <<Pst as PstFile>::ByteIndex as ByteIndexReadWrite>::new(free_bytes);
 
-        let mut first_fmap = [0; FMAP_FIRST_SIZE as usize];
-        for (entry, free_space) in first_fmap
-            .iter_mut()
-            .zip(amap_pages.iter().map(|page| page.max_free_slots()))
-        {
-            *entry = free_space;
-        }
-
         let pmap_pages: Vec<_> = (0..num_amap_pages.div_ceil(PMAP_PAGE_COUNT))
             .map(|index| {
                 let index =
@@ -6100,8 +6096,13 @@ where
         }
 
         let header = {
+            // MS-PST deprecates the header's rgbFM and rgbFP: they MUST be 0xFF, which is what Outlook writes and SCANPST restores.
             <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::first_free_map(&mut self.header)
-                .copy_from_slice(&first_fmap);
+                .fill(0xFF);
+            <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::first_free_page_map(
+                &mut self.header,
+            )
+            .fill(0xFF);
             self.header.update_unique();
 
             let root = self.header.root_mut();
