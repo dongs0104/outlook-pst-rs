@@ -2915,7 +2915,81 @@ fn push_subnode_tree(
     Ok(level_entries[0].1)
 }
 
-fn write_new_block(file: &mut File, block: NewBlock) -> io::Result<()> {
+/// Encodes blocks in memory and sends each run of contiguous blocks to the file in one write.
+/// The block encoders write field by field, and on Windows every one of those small writes is a
+/// costly system call.
+#[derive(Default)]
+struct BlockWriter {
+    base: u64,
+    position: u64,
+    buffer: Vec<u8>,
+}
+
+impl BlockWriter {
+    const MAX_RUN: usize = 8 << 20;
+
+    fn push(&mut self, file: &mut File, block: NewBlock) -> io::Result<()> {
+        let end = self.base + self.buffer.len() as u64;
+        if !self.buffer.is_empty() && (block.offset != end || self.buffer.len() >= Self::MAX_RUN) {
+            self.flush(file)?;
+        }
+        if self.buffer.is_empty() {
+            self.base = block.offset;
+        }
+        write_new_block(self, block)
+    }
+
+    fn flush(&mut self, file: &mut File) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            file.seek(SeekFrom::Start(self.base))?;
+            file.write_all(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Write for BlockWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let start =
+            usize::try_from(self.position - self.base).map_err(|_| PstError::IntegerConversion)?;
+        let end = start + data.len();
+        if self.buffer.len() < end {
+            self.buffer.resize(end, 0);
+        }
+        self.buffer[start..end].copy_from_slice(data);
+        self.position += data.len() as u64;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for BlockWriter {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => {
+                (self.base + self.buffer.len() as u64).checked_add_signed(delta)
+            }
+        };
+        match target {
+            Some(offset) if offset >= self.base => {
+                self.position = offset;
+                Ok(offset)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block writes only seek within the current run",
+            )),
+        }
+    }
+}
+
+fn write_new_block<W: Write + Seek>(file: &mut W, block: NewBlock) -> io::Result<()> {
     let block_signature = block_sig::compute_sig(block.offset as u32, u64::from(block.id) as u32);
     let trailer = UnicodeBlockTrailer::new(block.size, block_signature, 0, block.id)?;
     file.seek(SeekFrom::Start(block.offset))?;
@@ -3363,6 +3437,7 @@ fn collect_subnode_entries(
 
 fn write_pending_blocks(
     file: &mut File,
+    writer: &mut BlockWriter,
     bbt_entries: &mut Vec<UnicodeBlockBTreeEntry>,
     blocks: &mut Vec<NewBlock>,
 ) -> io::Result<()> {
@@ -3371,7 +3446,7 @@ fn write_pending_blocks(
             UnicodeBlockRef::new(block.id, UnicodeByteIndex::new(block.offset)),
             block.size,
         ));
-        write_new_block(file, block)?;
+        writer.push(file, block)?;
     }
     Ok(())
 }
@@ -3628,9 +3703,11 @@ fn commit_unicode_changes(
     // switch and one after it (the allocation map is invalid until it is rebuilt) suffice.
     header.root_mut().set_amap_status(AmapStatus::Invalid);
     header.update_unique();
+    let mut writer = BlockWriter::default();
     for block in blocks {
-        write_new_block(&mut file, block)?;
+        writer.push(&mut file, block)?;
     }
+    writer.flush(&mut file)?;
     #[cfg(test)]
     let before = bbt_entries.clone();
     if !update_block_ref_counts(
@@ -4276,6 +4353,7 @@ fn append_unicode_pst(
     header.update_unique();
 
     let mut message_entries = Vec::with_capacity(inputs.len());
+    let mut block_writer = BlockWriter::default();
     for (position, ((input, message), message_size)) in
         inputs.iter().zip(&messages).zip(&message_sizes).enumerate()
     {
@@ -4321,7 +4399,7 @@ fn append_unicode_pst(
                 &mut next_offset,
                 message_subnodes,
             )?;
-            write_pending_blocks(&mut file, &mut bbt_entries, &mut blocks)?;
+            write_pending_blocks(&mut file, &mut block_writer, &mut bbt_entries, &mut blocks)?;
             Ok::<_, io::Error>(UnicodeNodeBTreeEntry::new(
                 *message,
                 message_bid,
@@ -4344,6 +4422,8 @@ fn append_unicode_pst(
     }
 
     // Cell subnodes are NID_TYPE_LTP and the row matrix is internal, so the next index counts every type.
+    block_writer.flush(&mut file)?;
+
     let next_contents_subnode = contents_subnodes
         .iter()
         .map(|entry| entry.node().index())
